@@ -1540,3 +1540,504 @@ function audit() {
     if (!d.outcome) epNoOutcome.push(e.path);
   }
   if (epNoOutcome.length > 0) {
+
+    issues.push({
+      type: 'episode-no-outcome',
+      severity: 'info',
+      detail: `${epNoOutcome.length} 条 Episode 缺 outcome 字段（老格式），无法判断成败`,
+      paths: epNoOutcome.slice(0, 10),
+    });
+  }
+
+  // 8. 【新增】procedure 全胜率异常：success_rate=1.0 但 times_applied>5，可能从未记录失败
+  const realProcPages = pages.filter(p => p.kind === 'procedure' && /^P-\d{4}/.test(path.basename(p.path)));
+  const suspiciousProcs = [];
+  for (const p of realProcPages) {
+    let d = {};
+    try { d = parseFrontmatter(fs.readFileSync(path.join(getVault(), p.path), 'utf8')).data; } catch {}
+    const sr = parseFloat(d.success_rate);
+    const n = parseInt(d.times_applied, 10) || 0;
+    if (sr === 1 && n >= 5) suspiciousProcs.push(p.path);
+  }
+  if (suspiciousProcs.length > 0) {
+    issues.push({
+      type: 'procedure-never-fails',
+      severity: 'info',
+      detail: `${suspiciousProcs.length} 条 procedure 声称 100% 成功率且用了 5+ 次 —— 是否只记成功不记失败？`,
+      paths: suspiciousProcs,
+    });
+  }
+
+  // 9. 【新增】预期落空：这是发现"语义层错误"的唯一信号
+  //
+  // contradictions 只能抓形式矛盾；如果一个结论本身算错了、库里没有对立说法，
+  // 矛盾扫描永远抓不出来。唯一线索是"我以为会这样，实际不是"。
+  const expectationMisses = [];
+  for (const e of epPages) {
+    let d = {};
+    try { d = parseFrontmatter(fs.readFileSync(path.join(getVault(), e.path), 'utf8')).data; } catch {}
+    if (d.expectation && d.expectation_held === false) {
+      expectationMisses.push({ path: e.path, title: e.title, expectation: d.expectation });
+    }
+  }
+  if (expectationMisses.length > 0) {
+    issues.push({
+      type: 'expectation-failed',
+      severity: 'warn',
+      detail: `${expectationMisses.length} 次「我以为会这样，实际不是」——语义层错误的最强信号`,
+      paths: expectationMisses.map(x => `${x.path}  ← 预期：${x.expectation}`),
+    });
+  }
+
+  return {
+    timestamp: new Date().toISOString(),
+    totalPages: pages.length,
+    byKind: pages.reduce((acc, p) => {
+      acc[p.kind] = (acc[p.kind] || 0) + 1;
+      return acc;
+    }, {}),
+    issues,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 统计
+// ─────────────────────────────────────────────────────────────
+
+function stats() {
+  const pages = scanVault();
+  const actMap = activationMap();
+  const log = readLog();
+
+  const byKind = {};
+  const bySource = {};
+  for (const p of pages) {
+    byKind[p.kind] = (byKind[p.kind] || 0) + 1;
+    if (p.source) bySource[p.source] = (bySource[p.source] || 0) + 1;
+  }
+
+  const episodes = pages.filter(p => p.kind === 'episode');
+  const byStatus = {};
+  for (const e of episodes) {
+    const s = e.status || 'unknown';
+    byStatus[s] = (byStatus[s] || 0) + 1;
+  }
+
+  const topActive = [...actMap.entries()]
+    .map(([p, a]) => ({ path: p, activation: Math.round(a * 1000) / 1000 }))
+    .sort((a, b) => b.activation - a.activation)
+    .slice(0, 10);
+
+  return {
+    vault: getVault(),
+    totalPages: pages.length,
+    byKind,
+    sourceDistribution: bySource,
+    episodes: { total: episodes.length, byStatus },
+    procedures: {
+      total: pages.filter(p => p.kind === 'procedure').length,
+      withActivation: pages.filter(p => p.kind === 'procedure' && (actMap.get(p.path) ?? 0) > 0).length,
+    },
+    logEntries: log.length,
+    topActivated: topActive,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 联想图（HippoRAG / Personalized PageRank）
+//
+// 依据：Gutiérrez et al. (2024) HippoRAG —— 海马体索引 ≈ Personalized PageRank
+// 认知对应：启动扩散（spreading activation）。想起一件事时，
+//          与之相连的事会被"点亮"，即使没直接检索它。
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 从全库 wiki-link 建有向图。
+ * 返回 { nodes: Map<path, idx>, adj: Array<Array<{to, w}>>, titleIndex: Map<title, path> }
+ */
+function buildGraph(pages) {
+  // 标题 / 文件名 → 路径（用于解析 [[短名]]）
+  const titleIndex = new Map();
+  for (const p of pages) {
+    const base = path.basename(p.path, '.md');
+    titleIndex.set(base.toLowerCase(), p.path);
+    titleIndex.set(p.path.toLowerCase(), p.path);
+    if (p.title) titleIndex.set(p.title.toLowerCase(), p.path);
+  }
+
+  const nodes = new Map();
+  for (let i = 0; i < pages.length; i++) nodes.set(pages[i].path, i);
+  const adj = pages.map(() => []);
+
+  for (let i = 0; i < pages.length; i++) {
+    const p = pages[i];
+    let text;
+    try {
+      text = fs.readFileSync(path.join(getVault(), p.path), 'utf8');
+    } catch { continue; }
+
+    // 提取 [[target]] 或 [[target|alias]]
+    const seen = new Map();
+    for (const m of text.matchAll(/\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]/g)) {
+      // 归一化路径分隔符：Obsidian 规范用 /，但库里混有 \（Windows 习惯），两种都要认
+      const raw = m[1].trim().replace(/\\/g, '/');
+      if (!raw) continue;
+      const key = raw.toLowerCase();
+      let target = titleIndex.get(key);
+
+      // 未直接命中：尝试后缀匹配（Obsidian 允许省略路径）
+      if (!target) {
+        const cand = pages.find(pg => pg.path.toLowerCase().endsWith('/' + key + '.md')
+          || pg.path.toLowerCase() === key + '.md');
+        if (cand) target = cand.path;
+      }
+      if (!target) continue;
+      if (target === p.path) continue;
+      seen.set(target, (seen.get(target) || 0) + 1);
+    }
+
+    for (const [target, cnt] of seen) {
+      const j = nodes.get(target);
+      if (j === undefined) continue;
+      // 重复链接略微加权，但封顶，避免枢纽页 dominate
+      adj[i].push({ to: j, w: Math.min(1 + (cnt - 1) * 0.3, 2) });
+      // 反向边权重低一些（引用关系有方向）
+      adj[j].push({ to: i, w: 0.5 });
+    }
+  }
+
+  return { nodes, adj, titleIndex, pages };
+}
+
+/**
+ * Personalized PageRank（幂迭代）
+ * P = α·M·P + (1−α)·v
+ *
+ * @param seedIdx 种子节点索引数组
+ * @param alpha   阻尼系数，0.85 是 PageRank 经典值
+ * @param iters   迭代次数
+ */
+function ppr(graph, seedIdx, { alpha = 0.85, iters = 20 } = {}) {
+  const n = graph.pages.length;
+  if (seedIdx.length === 0) return new Float64Array(n);
+
+  const v = new Float64Array(n);
+  for (const i of seedIdx) v[i] = 1 / seedIdx.length;
+
+  let p = Float64Array.from(v);
+
+  // 出度归一化用 sqrt 软化：
+  // 经典 PPR 用 sum(w) 直接归一，导致 35 条出链的枢纽页每条只分到 1/35，
+  // 目标页得分被摊到 floor 以下。平方根归一（Haveliwala 2003 的
+  // "topic-sensitive PageRank" 里对 hub 的处理思路）能保留枢纽的传导能力，
+  // 又不让它淹没小页面。
+  const outW = graph.adj.map(edges => {
+    let s = 0;
+    for (const e of edges) s += e.w;
+    return s > 0 ? Math.sqrt(s) : 0;
+  });
+
+  for (let iter = 0; iter < iters; iter++) {
+    const next = new Float64Array(n);
+    for (let i = 0; i < n; i++) next[i] = (1 - alpha) * v[i];
+
+    for (let i = 0; i < n; i++) {
+      const edges = graph.adj[i];
+      if (!edges.length || outW[i] === 0) {
+        for (const s of seedIdx) next[s] += (alpha * p[i]) / seedIdx.length;
+        continue;
+      }
+      for (const e of edges) {
+        // 边权 / sqrt(出度和)，不是 / 出度和
+        next[e.to] += alpha * p[i] * (e.w / outW[i]);
+      }
+    }
+
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += next[i];
+    if (sum > 0) for (let i = 0; i < n; i++) next[i] /= sum;
+    p = next;
+  }
+
+  return p;
+}
+
+/**
+ * 联想召回：直接命中 + 图扩散
+ *
+ * 返回两类：
+ *   direct   直接文本/线索命中（种子）
+ *   spread   通过图到达的关联页（联想）
+ */
+function recallWithAssociation(query, pages, opts = {}) {
+  const limit = opts.limit ?? 10;
+  const spreadLimit = opts.spreadLimit ?? 8;
+  const beta = opts.beta ?? 0.35;   // 联想项的权重折扣
+  const useSemantic = opts.semantic !== false;
+
+  // ① 直接命中（现有逻辑）
+  const direct = recall(query, pages, { limit, minScore: opts.minScore ?? 2 });
+
+  if (!opts.spread || direct.length === 0) {
+    return { direct, spread: [], tag: {} };
+  }
+
+  // ② 建图：显式双链 + （可选）语义近邻
+  const explicit = buildGraph(pages);
+  let graph = explicit;
+
+  if (useSemantic) {
+    const semantic = buildSemanticGraph(pages);
+    const merged = explicit.adj.map((edges, i) => {
+      const out = edges.slice();
+      const existing = new Set(edges.map(e => e.to));
+      for (const e of semantic.adj[i] || []) {
+        if (!existing.has(e.to)) out.push(e);
+      }
+      return out;
+    });
+    graph = { nodes: explicit.nodes, adj: merged, pages };
+  }
+
+  // ③ 种子选取：直接命中 + 同项目的枢纽页（项目主页 / 总览 / 索引）
+  //
+  // 为什么需要这一步：遇到「蛋糕」这种高频词，命中的往往是项目内的证据子页，
+  // 它们的出链全在同一目录内部，跨项目扩散不出去。
+  // 人类不会从"某个证据文件"开始联想，而是从"那个项目"开始。
+  const seedPaths = new Set(direct.map(d => d.path));
+
+  // 收集直接命中涉及的项目
+  const seedProjects = new Set(direct.map(d => projectOf(d.path)).filter(Boolean));
+
+  for (const p of pages) {
+    if (seedPaths.has(p.path)) continue;
+    const pj = projectOf(p.path);
+    if (!pj || !seedProjects.has(pj)) continue;
+
+    // 判定是否枢纽页：项目主页（project/<名>/<名>.md）、总览、索引、README
+    const base = path.basename(p.path, '.md');
+    const parts = p.path.split('/');
+    const isProjectHome = pj === base;   // 如 10-项目/X/X.md
+    const isOverview = /^(当前状态|总览|总索引|索引|README|交接)/.test(base)
+                    || /00-总览\//.test(p.path);
+
+    if (isProjectHome || isOverview) {
+      seedPaths.add(p.path);
+    }
+  }
+
+  const seedIdx = [...seedPaths]
+    .map(pth => graph.nodes.get(pth))
+    .filter(i => i !== undefined);
+
+  if (seedIdx.length === 0) return { direct, spread: [], tag: {} };
+
+  const p = ppr(graph, seedIdx);
+
+  // ③ 取 PPR 得分高、但不在 direct 里的
+  const directPaths = new Set(direct.map(d => d.path));
+  const spreads = [];
+  for (let i = 0; i < graph.pages.length; i++) {
+    const pg = graph.pages[i];
+    if (directPaths.has(pg.path)) continue;
+    if (pg.kind === 'index' || pg.kind === 'record') continue;
+    if (p[i] <= 0) continue;
+
+    // 标注这条联想的来源：显式双链 还是 语义相近
+    const hasExplicit = explicit.adj[seedIdx[0]]?.some(e => e.to === i);
+    const via = hasExplicit ? 'link' : 'semantic';
+
+    spreads.push({ ...pg, score: p[i] * 1000 * beta, via });
+  }
+  spreads.sort((a, b) => b.score - a.score);
+
+  if (spreads.length === 0) {
+    return { direct, spread: [], tag: {} };
+  }
+
+  // 自适应阈值 + 绝对下限
+  //
+  // 只用相对分位不够：当整体都很弱时（比如查询命中的是一篇会话记录），
+  // 「最强的联想」也只有 2 分，仍是噪声。
+  // 人类联想有绝对门槛——太弱的关联根本不会浮上来。
+  const topSpreadScore = spreads[0].score;
+  const keepRatio = opts.spreadMinRatio ?? 0.25;
+  const absFloor = opts.spreadAbsFloor ?? 2.5;   // 绝对下限：低于 2.5 分视为噪声
+  const floor = Math.max(topSpreadScore * keepRatio, absFloor);
+  const filtered = spreads.filter(s => s.score >= floor);
+
+  if (filtered.length === 0) {
+    return { direct, spread: [], tag: { suppressed: spreads.length, floor } };
+  }
+
+  // 跨项目加分：人类联想最有价值的是「跨出当前领域」。
+  // 同项目内部的联想往往只是"目录邻居"，信息量低。
+  const directProjects = new Set(direct.map(d => projectOf(d.path)).filter(Boolean));
+  for (const s of filtered) {
+    const pj = projectOf(s.path);
+    if (pj && directProjects.size && !directProjects.has(pj)) {
+      s.score *= 1.8;
+      s.cross = true;
+    }
+  }
+  filtered.sort((a, b) => b.score - a.score);
+
+  const topSpread = filtered.slice(0, spreadLimit);
+
+  for (const s of topSpread) {
+    appendLog({
+      op: 'recall', path: s.path, q: query,
+      score: Math.round(s.score * 100) / 100, via: 'spread:' + s.via,
+    });
+  }
+
+  return { direct, spread: topSpread, tag: { filteredOut: spreads.length - filtered.length, floor } };
+}
+
+/**
+ * 语义近邻图：不依赖 wiki-link，靠共享罕见词建立隐式边。
+ *
+ * 认知对应：人类的联想不只有"记得写过链接"这一种。
+ *          两个从没被联系起来的概念，只要内涵相近，就能在你脑子里碰头。
+ *          这一层补的就是"从未显式连接但语义相邻"的联想。
+ *
+ * 做法：对每个页面取 top-N 高 IDF token 作为"指纹"，
+ *      指纹重叠 ≥ 阈值的两页之间加一条隐式边（权重按重叠度）。
+ */
+function buildSemanticGraph(pages, { topTokens = 8, maxEdgesPerNode = 6 } = {}) {
+  const n = pages.length;
+  const nodes = new Map();
+  for (let i = 0; i < n; i++) nodes.set(pages[i].path, i);
+
+  // ① 算每个页面的 token 集合与全局 DF
+  const docTokens = [];
+  const df = new Map();
+  for (const p of pages) {
+    const text = (p.title + ' ' + p.cues.join(' ') + ' ' + p.preview).toLowerCase();
+    const toks = new Set();
+    for (const m of text.matchAll(/[a-z0-9_+#.]{2,}/g)) toks.add(m[0]);
+    const cjk = text.replace(/[^\u4e00-\u9fa5]/g, '');
+    for (let k = 2; k <= 3; k++) {
+      for (let i2 = 0; i2 + k <= cjk.length; i2++) toks.add(cjk.slice(i2, i2 + k));
+    }
+    for (const t of toks) df.set(t, (df.get(t) || 0) + 1);
+    docTokens.push(toks);
+  }
+
+  // ② 每页取 IDF 最高的 top-N 作为指纹
+  const fingerprints = [];
+  for (let i = 0; i < n; i++) {
+    const scored = [];
+    for (const t of docTokens[i]) {
+      if (t.length < 2) continue;
+      const idf = Math.log(1 + n / (df.get(t) || 1));
+      if (idf < 1.5) continue;   // 太常见的词不参与指纹
+      scored.push([t, idf]);
+    }
+    scored.sort((a, b) => b[1] - a[1]);
+    fingerprints.push(scored.slice(0, topTokens));
+  }
+
+  // ③ 倒排：token → 出现在哪些页
+  const inverted = new Map();
+  for (let i = 0; i < n; i++) {
+    for (const [t] of fingerprints[i]) {
+      if (!inverted.has(t)) inverted.set(t, []);
+      inverted.get(t).push(i);
+    }
+  }
+
+  // ④ 两两累计共享罕见 token
+  const pairScore = new Map();   // "i|j" → 得分
+  for (const [, docs] of inverted) {
+    if (docs.length < 2 || docs.length > 60) continue;   // 跳过过大的簇
+    for (let a = 0; a < docs.length; a++) {
+      for (let b = a + 1; b < docs.length; b++) {
+        const key = docs[a] + '|' + docs[b];
+        pairScore.set(key, (pairScore.get(key) || 0) + 1);
+      }
+    }
+  }
+
+  // ⑤ 每节点保留最强的若干条
+  const adj = pages.map(() => []);
+  const perNode = new Map();
+  for (const [key, score] of pairScore) {
+    if (score < 2) continue;   // 至少共享 2 个罕见 token
+    const [ia, ib] = key.split('|').map(Number);
+    const listA = perNode.get(ia) || [];
+    const listB = perNode.get(ib) || [];
+    listA.push([ib, score]);
+    listB.push([ia, score]);
+    perNode.set(ia, listA);
+    perNode.set(ib, listB);
+  }
+  for (const [i, list] of perNode) {
+    list.sort((a, b) => b[1] - a[1]);
+    for (const [j, s] of list.slice(0, maxEdgesPerNode)) {
+      // 隐式边权重低于显式双链（0.4 vs 1~2）
+      adj[i].push({ to: j, w: Math.min(0.4 + s * 0.1, 1.0) });
+    }
+  }
+
+  return { nodes, adj, pages };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 矛盾扫描（自我推翻的地基）
+//
+// 认知对应：人类的"认知失调"——两个互相矛盾的信念不能长期共存，
+// 必然有一个被推翻或修正。系统里也一样，只是它不会自动感到不适，
+// 所以要靠扫描器定期找出"这里可能打架了"。
+//
+// 三种矛盾类型：
+//   A. 同一主体的正反结论（选了 X vs 放弃 X）
+//   B. 同一参数的两个不同值
+//   C. 明确标注时间却先后颠倒的判断
+// ─────────────────────────────────────────────────────────────
+
+// 反义/取舍词对（顺序重要：先匹配负向，因为"放弃 X 选 Y"里 X 是负向）
+const OPPOSE_PAIRS = [
+  ['启用', '停用'], ['开启', '关闭'], ['保留', '移除'],
+  ['支持', '不支持'], ['可行', '不可行'],
+  ['成功', '失败'], ['有效', '无效'], ['可以', '不可以'],
+  ['选择', '放弃'], ['采用', '放弃'],
+  ['必须', '禁止'], ['升级', '降级'], ['放大', '缩小'],
+];
+
+function findContradictions(pages) {
+  const conflicts = [];
+
+  // ── A 类：同一关键实体上出现相反方向 ──
+  //
+  // 第一版用"标题去方向词后的剩余串"当主体，结果被切碎（ADR-0034 与 ADR-0037
+  // 都讲 IDA，但剩余串一个是"逆向引擎选Ghidra-12.1.4加REA-6.8.0"，一个是
+  // "IDA-9.4落地并接入REA且定为逆向首"，永远匹配不上）。
+  //
+  // 改用「实体 + 方向」模型：
+  //   实体 = 标题里出现的技术名词（英文词 / 大写缩写 / 中文专名）
+  //   方向 = 选择/放弃、可行/不可行 等对立词
+  //   同一实体上既有 pos 又有 neg → 矛盾
+  const ENTITY_PATTERNS = [
+    /\b([A-Z][A-Za-z0-9._-]{1,20})\b/g,           // IDA, Ghidra, ONNX, COM
+    /\b([a-z]{2,}[0-9][a-z0-9.]*)\b/gi,            // v1.1.4, s60v3
+    /([\u4e00-\u9fa5]{2,6})(?=模型|引擎|插件|方案|算法|管线|架构|协议|接口)/g,  // 模型名
+    // 中文名词短语：方向词之后的 2-8 字（"选择方案X" → "方案X"）
+    // 2026-11-18 补：原来只认前面带专业词的，导致「方案X」这类纯中文主体抽不出
+    /(?:选择|采用|放弃|启用|停用|开启|关闭|保留|移除|支持|禁止|升级|降级)([\u4e00-\u9fa5A-Za-z0-9]{2,10})/g,
+  ];
+
+  // 实体黑名单：这些词太泛，做实体只会制造噪声
+  const ENTITY_STOP = new Set([
+    'ai', 'api', 'the', 'and', 'for', 'not', 'all', 'any', 'one', 'two', 'per',
+    'id', 'ok', 'no', 'yes', 'xx', 'abc', 'http', 'https', 'www', 'com', 'org',
+    'v1', 'v2', 'v3', 'v4', 'v5', 'md', 'json', 'txt', 'png', 'jpg', 'exe',
+    'dll', 'py', 'js', 'ts', 'css', 'html', 'xml', 'yml', 'yaml', 'log',
+  ]);
+
+  const decisions = [];
+  for (const p of pages) {
+    if (!['decision', 'fact', 'procedure'].includes(p.kind)) continue;
+    if (p.refuted) continue;
+
+    const title = p.title || path.basename(p.path, '.md');
