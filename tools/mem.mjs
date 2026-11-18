@@ -3043,3 +3043,110 @@ function main() {
     // ── 执行显式声明推翻（全自动，零猜测）──
     if (refutesRaw && refutesRaw !== true) {
       const targets = String(refutesRaw).split(';').map(s => s.trim()).filter(Boolean);
+
+      const bakDir = path.join(getSYS(), 'backups');
+      let done = 0, failed = [];
+
+      for (const t of targets) {
+        const full = path.join(getVault(), t);
+        if (!fs.existsSync(full)) { failed.push({ path: t, why: '文件不存在' }); continue; }
+
+        let txt = fs.readFileSync(full, 'utf8');
+        const fi = txt.indexOf('\n---', 3);
+        if (fi === -1) { failed.push({ path: t, why: '无 frontmatter' }); continue; }
+
+        let fm = txt.slice(3, fi);
+        if (/^(refuted|superseded_by)\s*:/m.test(fm)) {
+          failed.push({ path: t, why: '已有标记，跳过' });
+          continue;
+        }
+
+        // 备份（可回滚）
+        fs.mkdirSync(bakDir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const bakName = `${path.basename(t, '.md')}.${stamp}.bak`;
+        fs.writeFileSync(path.join(bakDir, bakName), txt, 'utf8');
+
+        const field = refuteHard ? 'refuted: true' : `superseded_by: ${JSON.stringify(r.id)}`;
+        const extra = refuteHard
+          ? `\nrefuted_by: ${JSON.stringify(r.id)}\nrefuted_reason: ${JSON.stringify(String(title))}`
+          : '';
+        fm = fm.replace(/\s*$/, '') + `\n${field}${extra}\nexplicit_refute: true`;
+        fs.writeFileSync(full, '---' + fm + txt.slice(fi), 'utf8');
+
+        appendLog({
+          op: refuteHard ? 'refute' : 'supersede',
+          path: t, by: r.id, mode: refuteHard ? 'refuted' : 'superseded',
+          explicit: true, backup: bakName,
+        });
+        done++;
+      }
+
+      console.log('');
+      console.log(`✅ 已按 --refutes 执行 ${done} 页（${refuteHard ? 'refuted：彻底排除' : 'superseded：降权可回退'}）`);
+      if (failed.length) {
+        console.log(`   跳过 ${failed.length} 页：`);
+        for (const f of failed) console.log(`     ${f.path} — ${f.why}`);
+      }
+      console.log(`   撤销：node mem.mjs rollback --all --apply`);
+    }
+
+    // 自动冲突检测结果（仅在有 --refutes 时跳过，避免重复打扰）
+    if (!refutesRaw && r.conflicts && r.conflicts.length) {
+      const auto = r.conflicts.filter(c => c.autoSuperseded);
+      const manual = r.conflicts.filter(c => !c.autoSuperseded);
+
+      if (auto.length) {
+        console.log('');
+        console.log(`✅ 系统已自动纠错 ${auto.length} 条（标 superseded_by，可回退）：`);
+        for (const c of auto) console.log(`   ${c.path}`);
+      }
+      if (manual.length) {
+        console.log('');
+        console.log(`🔴 另有 ${manual.length} 条需人工裁决：`);
+        for (const c of manual) {
+          console.log(`   ${c.path}`);
+          console.log(`      ${c.title}（相关度 ${c.score}）`);
+        }
+        console.log(`   写入了 proposals/冲突待裁决.md`);
+      }
+    }
+    console.log(`  提示：运行 node mem.mjs index 更新目录`);
+    return;
+  }
+
+  if (cmd === 'distill') {
+    const r = distill({ apply: hasFlag('apply') });
+    console.log(JSON.stringify(r, null, 2));
+    return;
+  }
+
+  if (cmd === 'compact') {
+    const r = compact({ apply: hasFlag('apply') });
+    console.log(JSON.stringify(r, null, 2));
+    return;
+  }
+
+  if (cmd === 'audit') {
+    const r = audit();
+    console.log(`总页数：${r.totalPages}`);
+    console.log('分类：', JSON.stringify(r.byKind));
+    console.log(`\n问题：${r.issues.length} 项`);
+    for (const i of r.issues) {
+      console.log(`\n[${i.severity}] ${i.type}: ${i.detail}`);
+      for (const p of (i.paths || []).slice(0, 10)) console.log(`    ${p}`);
+    }
+    return;
+  }
+
+  if (cmd === 'stats') {
+    const s = stats();
+    console.log(JSON.stringify(s, null, 2));
+    return;
+  }
+
+  console.error(`未知命令：${cmd}`);
+  process.exit(1);
+}
+
+main();
