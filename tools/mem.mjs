@@ -1039,3 +1039,504 @@ function detectConflictsForEpisode({ id, relPath, cues, title, body, outcome }) 
   if (isDuplicate) {
     appendLog({ op: 'conflict_detected', path: relPath, suspects: suspects.length, duplicate: true });
     return suspects.map(s => ({ path: s.path, title: s.title, score: Math.round(s.score * 10) / 10 }));
+
+  }
+
+  const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
+  const lines = [
+    `## ${ts}  ← 由 ${id} 自动检出`,
+    '',
+    `**新结论**：${title}`,
+    '',
+    `**可能被影响的旧页**（${suspects.length} 条，按相关度排序）：`,
+    '',
+  ];
+  for (const s of suspects) {
+    lines.push(`- [ ] \`${s.path}\``);
+    lines.push(`      ${s.title || ''}  （相关度 ${s.score.toFixed(1)}）`);
+  }
+  lines.push('');
+  lines.push('**处置**：`node mem.mjs review` 查看，`--confirm N` 确认，`--reject N` 拒绝。');
+  lines.push('');
+  lines.push('---');
+  lines.push('');
+
+  fs.writeFileSync(f, existTxt + lines.join('\n'), 'utf8');
+
+  appendLog({ op: 'conflict_detected', path: relPath, suspects: suspects.length });
+
+  // ── 自动纠错：默认关闭，需显式开启（2026-11-18 重要修正）──
+  //
+  // 血泪教训：第一版自动纠错没有置信度门槛，实测时把 ADR-0037
+  // （讲 IDA 的正确结论）标成了「被 EP-xxx 取代」，差点污染真实库。
+  // 根因：cues 命中 ≥2 就算嫌疑，这个判据对"自动执行"来说太弱。
+  //
+  // 现在的安全设计：
+  //   · 默认只「报告」，不自动改
+  //   · 要自动改必须同时满足：
+  //       1. Episode 是 failure/partial
+  //       2. 标题含强否定词
+  //       3. 环境变量 MEM_AUTO_SUPERSEDE=1 显式开启
+  //       4. 命中的旧页在"同一项目内"（跨项目自动纠错风险最高）
+  //       5. 单次最多 1 条（而非 3 条）
+  //   · 全部改动可通过 `mem.mjs rollback` 一键撤销
+  const autoEnabled = process.env.MEM_AUTO_SUPERSEDE === '1';
+  const fileProject = projectOf(relPath);
+
+  const autoTitleText = String(title || '');
+  const STRONG_TITLE = ['是错的', '结论错', '判断错', '推翻', '不成立', '作废'];
+  const titleSaysWrong = STRONG_TITLE.some(w => autoTitleText.includes(w));
+  const sameProject = (p) => {
+    const pj = projectOf(p);
+    return pj && fileProject && pj === fileProject;
+  };
+
+  if (autoEnabled && (outcome === 'failure' || outcome === 'partial') && titleSaysWrong) {
+    const eligible = suspects.filter(s => sameProject(s.path)).slice(0, 1);
+    const autoFixed = [];
+
+    for (const s of eligible) {
+      const full = path.join(getVault(), s.path);
+      let txt;
+      try { txt = fs.readFileSync(full, 'utf8'); } catch { continue; }
+
+      const fi = txt.indexOf('\n---', 3);
+      if (fi === -1) continue;
+      let fm2 = txt.slice(3, fi);
+      if (/^(refuted|superseded_by)\s*:/m.test(fm2)) continue;
+
+      // 备份 + 记录可回滚
+      const bakDir = path.join(getSYS(), 'backups');
+      fs.mkdirSync(bakDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const bakName = `${path.basename(s.path, '.md')}.${stamp}.bak`;
+      fs.writeFileSync(path.join(bakDir, bakName), txt, 'utf8');
+
+      fm2 = fm2.replace(/\s*$/, '') + `\nsuperseded_by: ${JSON.stringify(id)}\nauto_superseded: true`;
+      fs.writeFileSync(full, '---' + fm2 + txt.slice(fi), 'utf8');
+
+      appendLog({
+        op: 'supersede', path: s.path, by: id, mode: 'superseded',
+        auto: true, backup: bakName,
+      });
+      autoFixed.push({ path: s.path, backup: bakName });
+    }
+
+    if (autoFixed.length) {
+      appendLog({ op: 'auto_supersede', episode: id, count: autoFixed.length });
+      return suspects.map(s => {
+        const f = autoFixed.find(a => a.path === s.path);
+        return { ...s, autoSuperseded: !!f, backup: f?.backup };
+      });
+    }
+  }
+
+  return suspects.map(s => ({ path: s.path, title: s.title, score: Math.round(s.score * 10) / 10 }));
+}
+
+// ─────────────────────────────────────────────────────────────
+// 蒸馏（模拟睡眠；CLS 交错复现）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 蒸馏：raw Episode → 语义页的巩固
+ *
+ * 修前（2026-11-18 前）：只把 status: raw 改成 distilled，什么都不做。
+ * 这是"假装工作"——机制存在但不产生任何效果，是最难发现的缺陷。
+ *
+ * 修后：真正产出三样东西
+ *   1. 失败清单（failures.md）—— 按 outcome=failure/partial 聚合，这是"别再犯"的依据
+ *   2. 经验池（lessons.md）—— 按 lesson 字段聚合
+ *   3. 蒸馏提案（proposals/）—— 每个 Episode 一条，含"建议合并进哪一页"
+ *
+ * 为什么不全自动改语义页：自动改写知识页的风险（覆盖、分叉）远大于漏写。
+ * 所以蒸馏产出「提案 + 聚合层」，改知识页仍需人工确认。
+ * 这对应人类的睡眠巩固：海马体复现给皮层，皮层自己决定怎么改写。
+ */
+function distill({ apply = false, limit = 20 } = {}) {
+  const pages = scanVault();
+  const rawEpisodes = pages.filter(p => p.kind === 'episode' && p.status === 'raw');
+
+  if (rawEpisodes.length === 0) {
+    return { message: '没有 status: raw 的 Episode，无需蒸馏', count: 0 };
+  }
+
+  // 读每个 Episode 的完整 frontmatter（outcome / lesson / corrections / schema）
+  const details = rawEpisodes.map(e => {
+    let data = {};
+    try {
+      data = parseFrontmatter(fs.readFileSync(path.join(getVault(), e.path), 'utf8')).data;
+    } catch { /* 保底空对象 */ }
+    return {
+      path: e.path,
+      title: e.title,
+      schema: data.schema || '未分类',
+      project: data.project || '未归属',
+      outcome: data.outcome || 'unknown',
+      lesson: data.lesson || null,
+      corrections: Array.isArray(data.corrections) ? data.corrections : [],
+    };
+  });
+
+  // 按 schema 分组
+  const groups = new Map();
+  for (const d of details) {
+    if (!groups.has(d.schema)) groups.set(d.schema, []);
+    groups.get(d.schema).push(d);
+  }
+
+  // 失败与纠错聚合
+  const failures = details.filter(d => d.outcome === 'failure' || d.outcome === 'partial');
+  const allCorrections = details.flatMap(d => d.corrections.map(c => ({ ep: d.path, text: c })));
+  const lessons = details.filter(d => d.lesson);
+
+  const projects = new Set(details.map(d => d.project).filter(Boolean));
+  const interleaved = projects.size > 1;
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    rawCount: details.length,
+    projects: [...projects],
+    interleaved,
+    interleavedNote: interleaved
+      ? `涉及 ${projects.size} 个项目，满足 CLS 交错复现要求`
+      : `只涉及 1 个项目（${[...projects][0] || '未知'}），警告：缺少交错复现，可能灾难性遗忘`,
+    groups: [...groups.entries()].map(([schema, eps]) => ({
+      schema,
+      count: eps.length,
+      suggestProcedure: eps.length >= 3,
+      episodes: eps.map(e => e.path),
+    })),
+    failures: failures.map(f => ({ path: f.path, title: f.title, outcome: f.outcome })),
+    corrections: allCorrections,
+    lessons: lessons.map(l => ({ path: l.path, lesson: l.lesson })),
+    applied: false,
+  };
+
+  if (apply) {
+    const ts = new Date().toISOString().slice(0, 10);
+    const consolidateDir = path.join(getSYS(), 'consolidated');
+    fs.mkdirSync(consolidateDir, { recursive: true });
+
+    // ① 失败清单（追加式，永久累积）
+    if (failures.length || allCorrections.length) {
+      const fFail = path.join(consolidateDir, 'failures.md');
+      const exist = fs.existsSync(fFail) ? fs.readFileSync(fFail, 'utf8') : '# 失败与纠错台账\n\n> 每次蒸馏追加。这是"别再犯同样的错"的唯一依据。\n\n';
+      const lines = [`## ${ts}`, ''];
+      for (const f of failures) {
+        lines.push(`- **${f.outcome}** ${f.title}`);
+        lines.push(`  - ${f.path}`);
+      }
+      for (const c of allCorrections) {
+        lines.push(`- **纠错** ${c.text}`);
+        lines.push(`  - ${c.ep}`);
+      }
+      lines.push('');
+      fs.writeFileSync(fFail, exist + lines.join('\n') + '\n', 'utf8');
+    }
+
+    // ② 经验池
+    if (lessons.length) {
+      const fLes = path.join(consolidateDir, 'lessons.md');
+      const exist = fs.existsSync(fLes) ? fs.readFileSync(fLes, 'utf8') : '# 经验池\n\n> 每次蒸馏追加。可蒸馏成 procedure 的候选。\n\n';
+      const lines = [`## ${ts}`, ''];
+      for (const l of lessons) {
+        lines.push(`- ${l.lesson}`);
+        lines.push(`  - ${l.path}`);
+      }
+      lines.push('');
+      fs.writeFileSync(fLes, exist + lines.join('\n') + '\n', 'utf8');
+    }
+
+    // ③ 蒸馏提案
+    const propDir = path.join(getSYS(), 'proposals');
+    fs.mkdirSync(propDir, { recursive: true });
+    for (const g of report.groups) {
+      const fProp = path.join(propDir, `${ts}-${g.schema}.md`);
+      const content = [
+        `# 蒸馏提案：${g.schema}`,
+        '',
+        `生成于 ${ts}`,
+        '',
+        `## 来源 Episode（${g.count} 条）`,
+        '',
+        ...g.episodes.map(e => `- ${e}`),
+        '',
+        g.suggestProcedure
+          ? '## ⚠ 建议抽成 procedure\n\n同一 schema 已达 3 条，符合 `30-习惯/procedures/` 的新增门槛。'
+          : '## 暂不建议抽 procedure\n\n同类不足 3 条。',
+        '',
+        '## 待人工确认',
+        '',
+        '- [ ] 这些结论该合并进哪个语义页？',
+        '- [ ] 有没有互相矛盾的？',
+        '- [ ] 有哪些应当标 superseded_by？',
+      ].join('\n');
+      fs.writeFileSync(fProp, content, 'utf8');
+    }
+
+    // ④ 标记已蒸馏
+    for (const e of rawEpisodes.slice(0, limit)) {
+      const full = path.join(getVault(), e.path);
+      let text = fs.readFileSync(full, 'utf8');
+      text = text.replace(/^status:\s*"?raw"?\s*$/m, 'status: distilled');
+      fs.writeFileSync(full, text, 'utf8');
+    }
+
+    report.applied = true;
+    report.distilledCount = Math.min(rawEpisodes.length, limit);
+    report.outputs = ['consolidated/failures.md', 'consolidated/lessons.md', `proposals/${ts}-*.md`];
+  }
+
+  // 写蒸馏日志
+  fs.mkdirSync(getDistillLogDir(), { recursive: true });
+  const logName = `distill-${new Date().toISOString().slice(0, 10)}.json`;
+  fs.writeFileSync(path.join(getDistillLogDir(), logName), JSON.stringify(report, null, 2), 'utf8');
+
+  return report;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 压缩（SHY：按比例下调；不删 cues/source）
+// ─────────────────────────────────────────────────────────────
+
+function compact({ apply = false, threshold = 0.15, archiveDays = 180 } = {}) {
+  const pages = scanVault();
+  const actMap = activationMap();
+  const now = Date.now();
+  const archiveMs = archiveDays * 24 * 3600 * 1000;
+
+  const candidates = [];
+
+  // ① Episode：活化度低 + 够老 → 压成一行（cues/source 全留）
+  for (const p of pages) {
+    if (p.kind !== 'episode') continue;
+    if (p.status === 'pruned') continue;
+
+    const act = actMap.get(p.path) ?? 0;
+    const ageMs = now - p.mtime * 1000;
+
+    // 失败经历永不压缩：那是"别再犯"的依据
+    let outcome = null;
+    try { outcome = parseFrontmatter(fs.readFileSync(path.join(getVault(), p.path), 'utf8')).data.outcome; } catch {}
+    if (outcome === 'failure') {
+      candidates.push({ path: p.path, title: p.title, activation: act, ageDays: Math.round(ageMs / 86400000), action: 'protect-failure' });
+      continue;
+    }
+
+    if (act < threshold && ageMs > archiveMs) {
+      candidates.push({
+        path: p.path, title: p.title,
+        activation: Math.round(act * 1000) / 1000,
+        ageDays: Math.round(ageMs / 86400000),
+        size: p.size, action: 'prune',
+      });
+    } else if (act >= threshold) {
+      candidates.push({
+        path: p.path, title: p.title,
+        activation: Math.round(act * 1000) / 1000,
+        ageDays: Math.round(ageMs / 86400000),
+        size: p.size, action: 'keep',
+      });
+    }
+  }
+
+  // ② 【新增】语义页的「淡出」——不压缩正文，只标 stale
+  //
+  // 人类语义记忆也会淡，但方式和情景记忆不同：
+  // 情景记忆是「细节消失、只留骨架」，语义记忆是「还知道，但不确定还准不准」。
+  // 所以语义页不压缩，只标记「需要复核」。
+  const stalePages = [];
+  for (const p of pages) {
+    if (!['decision', 'fact', 'project'].includes(p.kind)) continue;
+    const act = actMap.get(p.path) ?? 0;
+    const ageMs = now - p.mtime * 1000;
+
+    // 从未被 used 过 + 超过 1 年 → 标记 stale
+    if (act === 0 && ageMs > 365 * 24 * 3600 * 1000) {
+      stalePages.push({ path: p.path, title: p.title, ageDays: Math.round(ageMs / 86400000) });
+    }
+  }
+
+  const toPrune = candidates.filter(c => c.action === 'prune');
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    totalEpisodes: pages.filter(p => p.kind === 'episode').length,
+    pruned: toPrune.length,
+    kept: candidates.filter(c => c.action === 'keep').length,
+    protectedFailures: candidates.filter(c => c.action === 'protect-failure').length,
+    staleSemantic: stalePages.length,
+    candidates,
+    stalePages: stalePages.slice(0, 20),
+    applied: false,
+  };
+
+  if (apply && toPrune.length > 0) {
+    // 先做快照
+    fs.mkdirSync(getSnapshotDir(), { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const snapFile = path.join(getSnapshotDir(), `before-compact-${stamp}.jsonl`);
+    const snapLines = toPrune.map(c => {
+      const full = path.join(getVault(), c.path);
+      return JSON.stringify({ path: c.path, content: fs.readFileSync(full, 'utf8') });
+    });
+    fs.writeFileSync(snapFile, snapLines.join('\n'), 'utf8');
+
+    // 执行压缩：正文压成一行，cues 保留
+    for (const c of toPrune) {
+      const full = path.join(getVault(), c.path);
+      const text = fs.readFileSync(full, 'utf8');
+      const { data, body } = parseFrontmatter(text);
+
+      data.status = 'pruned';
+      data.pruned_at = new Date().toISOString();
+      data.pruned_from_size = c.size;
+
+      const firstLine = body
+        .split('\n')
+        .map(l => l.replace(/^#+\s*/, '').trim())
+        .filter(l => l && !l.startsWith('---'))[0] || '（无正文）';
+
+      const newBody = [
+        '',
+        `# ${data.title || c.title}`,
+        '',
+        '> 已压缩（季度 downscaling）。正文摘要保留一行，cues 与 source 完整保留。',
+        `> 原始快照：${path.basename(snapFile)}`,
+        '',
+        `**摘要**：${firstLine.slice(0, 200)}`,
+        '',
+      ].join('\n');
+
+      fs.writeFileSync(full, serializeFrontmatter(data) + '\n' + newBody, 'utf8');
+    }
+
+    report.applied = true;
+    report.snapshot = path.basename(snapFile);
+  }
+
+  return report;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 审计（健康检查）
+// ─────────────────────────────────────────────────────────────
+
+function audit() {
+  const pages = scanVault();
+  const actMap = activationMap();
+
+  const issues = [];
+
+  // 1. 重复结论（同 digest 的语义页）
+  const byDigest = new Map();
+  for (const p of pages) {
+    if (!['decision', 'fact', 'project'].includes(p.kind)) continue;
+    if (!byDigest.has(p.digest)) byDigest.set(p.digest, []);
+    byDigest.get(p.digest).push(p.path);
+  }
+  for (const [digest, paths] of byDigest) {
+    if (paths.length > 1) {
+      issues.push({ type: 'duplicate', severity: 'warn', detail: `重复内容 ${digest}`, paths });
+    }
+  }
+
+  // 2. 缺 trust 的语义页（可信度未标）
+  //
+  // 修复（2026-11-18）：原来检查的是「缺 source」，
+  // 但 source 在库里是「出处」语义，82 页都有，所以这个检查从来没意义。
+  // 现在检查 trust（可信度），并且**同时校验取值合法性**——
+  // 只查有无不查取值，正是之前漏掉 84 页违规的原因。
+  const VALID_TRUST = new Set(['verified', 'reported', 'inferred', 'recalled']);
+  const missingTrust = pages.filter(
+    p => ['decision', 'fact'].includes(p.kind) && !p.trust
+  );
+  if (missingTrust.length > 0) {
+    issues.push({
+      type: 'missing-trust',
+      severity: 'info',
+      detail: `${missingTrust.length} 条语义页未标可信度（trust）`,
+      paths: missingTrust.slice(0, 15).map(p => p.path),
+    });
+  }
+
+  // 2'. 非法 trust 值
+  const badTrust = pages.filter(
+    p => p.trust && !VALID_TRUST.has(String(p.trust))
+  );
+  if (badTrust.length > 0) {
+    issues.push({
+      type: 'invalid-trust',
+      severity: 'warn',
+      detail: `${badTrust.length} 条页面的 trust 取值不在四选一内`,
+      paths: badTrust.map(p => `${p.path}  → ${String(p.trust).slice(0, 40)}`),
+    });
+  }
+
+  // 3. 孤儿 procedure
+  const procPages = pages.filter(p => p.kind === 'procedure');
+  const orphanProcs = procPages.filter(p => (actMap.get(p.path) ?? 0) === 0);
+  if (orphanProcs.length > 0) {
+    issues.push({
+      type: 'orphan-procedure',
+      severity: 'info',
+      detail: `${orphanProcs.length} 条 procedure 从未被召回`,
+      paths: orphanProcs.map(p => p.path),
+    });
+  }
+
+  // 4. 堆积的 raw Episode
+  const rawEps = pages.filter(p => p.kind === 'episode' && p.status === 'raw');
+  if (rawEps.length > 10) {
+    issues.push({
+      type: 'episode-backlog',
+      severity: 'warn',
+      detail: `${rawEps.length} 条 Episode 未蒸馏`,
+      paths: [],
+    });
+  }
+
+  // 5. 已 superseded 但仍在活跃目录
+  const supersededActive = pages.filter(
+    p => p.superseded_by && !p.path.startsWith('40-归档/')
+  );
+  if (supersededActive.length > 0) {
+    issues.push({
+      type: 'superseded-not-archived',
+      severity: 'info',
+      detail: `${supersededActive.length} 条已取代的页仍在活跃目录`,
+      paths: supersededActive.map(p => p.path),
+    });
+  }
+
+  // 6. 【2026-11-18 新增】失败复盘：outcome=failure/partial 的 Episode 必须沉淀为 lesson
+  const epPages = pages.filter(p => p.kind === 'episode');
+  let failNoLesson = [];
+  let failCount = 0;
+  for (const e of epPages) {
+    let d = {};
+    try { d = parseFrontmatter(fs.readFileSync(path.join(getVault(), e.path), 'utf8')).data; } catch {}
+    const oc = d.outcome;
+    if (oc === 'failure' || oc === 'partial') {
+      failCount++;
+      if (!d.lesson) failNoLesson.push(e.path);
+    }
+  }
+  if (failNoLesson.length > 0) {
+    issues.push({
+      type: 'failure-without-lesson',
+      severity: 'warn',
+      detail: `${failNoLesson.length}/${failCount} 条失败/部分成功的 Episode 没写 lesson —— 学到了什么？`,
+      paths: failNoLesson,
+    });
+  }
+
+  // 7. 【新增】Episode 缺 outcome（无法区分成功与失败）
+  const epNoOutcome = [];
+  for (const e of epPages) {
+    let d = {};
+    try { d = parseFrontmatter(fs.readFileSync(path.join(getVault(), e.path), 'utf8')).data; } catch {}
+    if (!d.outcome) epNoOutcome.push(e.path);
+  }
+  if (epNoOutcome.length > 0) {
