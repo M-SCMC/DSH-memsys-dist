@@ -2542,3 +2542,504 @@ function main() {
         entries.push({ header: head, by: byMatch?.[1], claim: newClaim, items });
       }
     }
+
+
+    if (hasFlag('clear')) {
+      fs.writeFileSync(cf, '# 冲突待裁决\n\n> 系统自动检出。裁决后 `[ ]` 改 `[x]`。\n\n', 'utf8');
+      console.log('✓ 已清空待裁决清单');
+      return;
+    }
+
+    const confirmArg = arg('confirm', null);
+    const rejectArg = arg('reject', null);
+
+    if (confirmArg && confirmArg !== true) {
+      const idxs = String(confirmArg).split(',').map(s => parseInt(s.trim(), 10) - 1).filter(i => i >= 0);
+      let done = 0;
+      for (const i of idxs) {
+        const e = entries[i];
+        if (!e) continue;
+
+        // 对每个待裁决项执行 supersede
+        for (const it of e.items) {
+          const full = path.join(getVault(), it.path);
+          if (!fs.existsSync(full)) continue;
+          let t = fs.readFileSync(full, 'utf8');
+          const fi = t.indexOf('\n---', 3);
+          if (fi === -1) continue;
+          let fm = t.slice(3, fi);
+          if (/^(refuted|superseded_by)\s*:/m.test(fm)) continue;
+
+          fm = fm.replace(/\s*$/, '') + `\nsuperseded_by: ${JSON.stringify(e.by || 'manual')}\nconfirmed_by_human: true`;
+          fs.writeFileSync(full, '---' + fm + t.slice(fi), 'utf8');
+          appendLog({ op: 'supersede', path: it.path, by: e.by, mode: 'superseded', human: true });
+          done++;
+          console.log(`✓ 已标记 ${it.path}`);
+        }
+      }
+      console.log(`\n共标记 ${done} 页。`);
+      return;
+    }
+
+    if (rejectArg && rejectArg !== true) {
+      const idxs = String(rejectArg).split(',').map(s => parseInt(s.trim(), 10) - 1);
+      // 重建清单，去掉被拒绝的
+      const keep = blocks.filter((_, i) => !idxs.includes(i));
+      fs.writeFileSync(cf, '# 冲突待裁决\n\n> 系统自动检出。\n\n' + keep.map(b => '## ' + b).join(''), 'utf8');
+      console.log(`✓ 已拒绝 ${idxs.length} 条（从清单移除）`);
+      return;
+    }
+
+    // 列出
+    if (entries.length === 0) {
+      console.log('待裁决清单存在但没有解析出条目。文件可能格式异常。');
+      return;
+    }
+
+    console.log(`待裁决：${entries.length} 组\n`);
+    entries.forEach((e, i) => {
+      console.log(`【${i + 1}】${e.claim || e.header}`);
+      if (e.by) console.log(`     来源：${e.by}`);
+      for (const it of e.items) {
+        console.log(`     · ${it.title.slice(0, 50)}`);
+        console.log(`       ${it.path}`);
+      }
+      console.log('');
+    });
+    console.log('确认：node mem.mjs review --confirm 1,3');
+    console.log('拒绝：node mem.mjs review --reject 2');
+    return;
+  }
+
+  if (cmd === 'supersede') {
+    // 自动纠错：把「新论证推翻了旧结论」这件事，真正写进旧页的 frontmatter
+    //
+    // 2026-11-18 新增。背景：
+    //   原来系统只能"报告"嫌疑（proposals/冲突待裁决.md），
+    //   执行 refute 仍要人手动敲。用户明确要求「后续有新论证推翻了之前的，得自我纠错」。
+    //
+    // 安全设计（关键）：
+    //   · 默认 dry-run，只打印将改什么
+    //   · --apply 才真写，且自动备份
+    //   · --auto 才允许跳过 dry-run（仍会备份）
+    //   · 每次改动都记进 access.log 的 supersede 事件
+    const target = process.argv[3];
+    const by = arg('by', null);
+    const reason = arg('reason', null);
+    const apply = hasFlag('apply') || hasFlag('auto');
+
+    if (!target) {
+      console.error('用法：node mem.mjs supersede <旧页路径> --by "<新论证来源>" --reason "为什么" [--apply]');
+      process.exit(1);
+    }
+    if (!by || by === true) {
+      console.error('必须用 --by 指明是谁推翻了它（Episode ID 或新页路径）。');
+      console.error('理由：没有溯源的"推翻"等于伪造历史。');
+      process.exit(1);
+    }
+
+    const full = path.join(getVault(), target);
+    if (!fs.existsSync(full)) {
+      console.error(`找不到：${target}`);
+      process.exit(1);
+    }
+
+    let text = fs.readFileSync(full, 'utf8');
+    const i = text.indexOf('\n---', 3);
+    if (i === -1) { console.error('该文件没有 frontmatter'); process.exit(1); }
+
+    let fm = text.slice(3, i);
+    const rest = text.slice(i);
+
+    if (/^refuted\s*:/m.test(fm)) {
+      console.log(`已经是 refuted 状态，跳过：${target}`);
+      return;
+    }
+    if (/^superseded_by\s*:/m.test(fm)) {
+      console.log(`已有 superseded_by，跳过：${target}`);
+      return;
+    }
+
+    // 判断是"错了"还是"过时了"
+    // 规则：正文/标题里出现强否定词 → refuted（彻底废掉）
+    //       否则 → superseded_by（降权但仍可查）
+    const head = (text.slice(0, Math.min(600, text.length))).toLowerCase();
+    const STRONG = ['否定', '被推翻', '是错的', '不成立', '作废', '终结', '否定假设', '全部失败'];
+    const isWrong = STRONG.some(w => head.includes(w.toLowerCase()));
+
+    let newFm = fm.replace(/\s*$/, '');
+    if (isWrong) {
+      newFm += `\nrefuted: true`;
+      newFm += `\nrefuted_by: ${JSON.stringify(String(by))}`;
+      if (reason && reason !== true) newFm += `\nrefuted_reason: ${JSON.stringify(String(reason))}`;
+    } else {
+      newFm += `\nsuperseded_by: ${JSON.stringify(String(by))}`;
+    }
+
+    const mode = isWrong ? 'refuted（彻底排除）' : 'superseded_by（降权保留）';
+
+    if (!apply) {
+      console.log(`[dry-run] 将对 ${target} 施加：${mode}`);
+      console.log('  将追加的 frontmatter：');
+      for (const line of newFm.split('\n')) {
+        if (/^(refuted|superseded_by|refuted_by|refuted_reason)/.test(line)) {
+          console.log('    ' + line);
+        }
+      }
+      console.log('\n  加 --apply 执行。');
+      return;
+    }
+
+    // 备份
+    const bakDir = path.join(getSYS(), 'backups');
+    fs.mkdirSync(bakDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const bakFile = path.join(bakDir, `${path.basename(target, '.md')}.${stamp}.bak`);
+    fs.writeFileSync(bakFile, text, 'utf8');
+
+    fs.writeFileSync(full, '---' + newFm + rest, 'utf8');
+    appendLog({ op: 'supersede', path: target, by: String(by), mode: isWrong ? 'refuted' : 'superseded' });
+
+    console.log(`✓ ${target}`);
+    console.log(`  → ${mode}`);
+    console.log(`  推翻者：${by}`);
+    if (reason && reason !== true) console.log(`  理由：${reason}`);
+    console.log(`  备份：${path.basename(bakFile)}`);
+    return;
+  }
+
+  if (cmd === 'refute') {
+    const target = process.argv[3];
+    const reason = arg('reason', null);
+    const by = arg('by', null);
+    if (!target) {
+      console.error('用法：node mem.mjs refute <path> --reason "为什么错" [--by EP-xxx]');
+      process.exit(1);
+    }
+    const full = path.join(getVault(), target);
+    if (!fs.existsSync(full)) {
+      console.error(`找不到：${target}`);
+      console.error('提示：路径相对库根，例如 20-决策/跨项目/ADR-00XX-xxx.md');
+      process.exit(1);
+    }
+    let text = fs.readFileSync(full, 'utf8');
+    const i = text.indexOf('\n---', 3);
+    if (i === -1) { console.error('该文件没有 frontmatter'); process.exit(1); }
+
+    let fm = text.slice(3, i);
+    if (/^refuted\s*:/m.test(fm)) {
+      console.log('已经是 refuted 状态，跳过');
+      return;
+    }
+    fm = fm.replace(/\s*$/, '') + `\nrefuted: true`;
+    if (reason && reason !== true) fm += `\nrefuted_reason: ${JSON.stringify(String(reason))}`;
+    if (by && by !== true) fm += `\nrefuted_by: ${JSON.stringify(String(by))}`;
+    fs.writeFileSync(full, '---' + fm + text.slice(i), 'utf8');
+
+    appendLog({ op: 'refute', path: target, reason: reason || null });
+    console.log(`✓ 已标记为「被推翻」：${target}`);
+    console.log(`  理由：${reason || '(未填)'}`);
+    console.log('  效果：检索时完全不出现（不是降权），但保留在库里供溯源');
+    return;
+  }
+
+  if (cmd === 'activation') {
+    // 查单页的活化度与使用记录（brief 只显示 top3，查不到个别页）
+    const target = process.argv[3];
+    if (!target) {
+      console.error('用法：node mem.mjs activation <path>');
+      process.exit(1);
+    }
+    const log = readLog();
+    const times = log.filter(e => e.op === 'used' && e.path === target).map(e => e.t);
+    const a = activation(times);
+    const now = Date.now();
+    console.log(`路径：${target}`);
+    console.log(`使用次数：${times.length}`);
+    console.log(`活化度：${a.toFixed(4)}`);
+    if (times.length) {
+      const last = new Date(Math.max(...times));
+      const ageDays = (now - last.getTime()) / 86400000;
+      console.log(`最后使用：${last.toISOString().slice(0, 16)}（${ageDays.toFixed(1)} 天前）`);
+      console.log(`半衰：30 天；再 ${(30 * Math.log2(Math.max(a, 0.001) / 0.15)).toFixed(0)} 天后低于压缩阈值 0.15`);
+    } else {
+      console.log('从未被 mark 过（检索不算使用）');
+    }
+    return;
+  }
+
+  if (cmd === 'mark') {
+    // 两种用法：
+    //   mark <path>...                    只标记"用过"（强化活化度）
+    //   mark <P-xxxx> --ok / --fail       记录 procedure 的实战结果
+    const paths = [];
+    let verdict = null;
+    const VALUE_FLAGS2 = new Set(['note']);
+    for (let i = 3; i < process.argv.length; i++) {
+      const a = process.argv[i];
+      if (a === '--ok' || a === '--success') { verdict = true; continue; }
+      if (a === '--fail' || a === '--failed') { verdict = false; continue; }
+      if (a.startsWith('--')) {
+        const name = a.slice(2);
+        if (VALUE_FLAGS2.has(name) && i + 1 < process.argv.length && !process.argv[i + 1].startsWith('--')) i++;
+        continue;
+      }
+      paths.push(a);
+    }
+    if (paths.length === 0) {
+      console.error('用法：');
+      console.error('  node mem.mjs mark <path>...                 标记"用过"');
+      console.error('  node mem.mjs mark <P-xxxx.md> --ok|--fail --note "场景"   记录流程实战');
+      process.exit(1);
+    }
+
+    if (verdict !== null) {
+      const noteArg = arg('note', '');
+      for (const p of paths) {
+        const r = recordProcedureUse(p, verdict, { note: noteArg && noteArg !== true ? String(noteArg) : '' });
+        if (!r.ok) {
+          console.log(`✗ ${p}：${r.reason}`);
+          continue;
+        }
+        console.log(`✓ ${p}`);
+        console.log(`   ${verdict ? '成功' : '失败'} → times ${r.prevTimes}→${r.times}，成功率 ${r.prevRate ?? '—'}→${r.rate}`);
+      }
+      return;
+    }
+
+    markUsed(paths);
+    console.log(`✓ 已标记 ${paths.length} 页为"用过"`);
+    for (const p of paths) console.log(`  ${p}`);
+    return;
+  }
+
+  if (cmd === 'init') {
+    // 在当前目录初始化记忆库（2026-11-18 新增）
+    //
+    // 为什么需要：npx / 新手场景下，用户不想设环境变量、不想读文档，
+    // 就想在某个目录里直接开始。init 把「建目录 + 建索引」合成一步。
+    //
+    // 安全：目录里已有内容时先检查，不在非空目录里乱建东西。
+    const cwd = process.env.MEM_VAULT || process.cwd();
+
+    const existing = fs.readdirSync(cwd).filter(f => !f.startsWith('.'));
+    const alreadyVault = fs.existsSync(path.join(cwd, '99-系统', '记忆系统'));
+
+    if (alreadyVault) {
+      console.log(`已经是记忆库了：${cwd}`);
+      console.log('直接用 brief / index 即可。');
+      return;
+    }
+
+    if (existing.length > 0 && !hasFlag('force')) {
+      console.log(`当前目录不是空的（${existing.length} 项）：`);
+      for (const f of existing.slice(0, 8)) console.log('  ' + f);
+      if (existing.length > 8) console.log(`  …还有 ${existing.length - 8} 项`);
+      console.log('');
+      console.log('在这个目录里建记忆库会新增以下目录：');
+      console.log('  99-系统/记忆系统/  10-项目/  20-决策/  30-习惯/  40-归档/');
+      console.log('');
+      console.log('确认要建？加 --force：');
+      console.log(`  node "${process.argv[1]}" init --force`);
+      return;
+    }
+
+    const DIRS = [
+      '99-系统/记忆系统/tools',
+      '99-系统/记忆系统/templates',
+      '99-系统/记忆系统/proposals',
+      '99-系统/记忆系统/consolidated',
+      '99-系统/记忆系统/backups',
+      '10-项目',
+      '20-决策',
+      '30-习惯/procedures',
+      '40-归档/episodes',
+    ];
+
+    console.log(`初始化记忆库：${cwd}\n`);
+    for (const d of DIRS) {
+      const p = path.join(cwd, d);
+      if (!fs.existsSync(p)) {
+        fs.mkdirSync(p, { recursive: true });
+        console.log(`  + ${d}`);
+      }
+    }
+
+    // 复制工具自身（如果还不在这里）
+    const selfDir = path.dirname(fs.realpathSync(process.argv[1]));
+    const dstTools = path.join(cwd, '99-系统', '记忆系统', 'tools');
+    if (path.resolve(selfDir) !== path.resolve(dstTools)) {
+      let n = 0;
+      for (const f of fs.readdirSync(selfDir)) {
+        if (!f.endsWith('.mjs')) continue;
+        const dst = path.join(dstTools, f);
+        if (!fs.existsSync(dst)) { fs.copyFileSync(path.join(selfDir, f), dst); n++; }
+      }
+      if (n) console.log(`  + 复制 ${n} 个工具到 99-系统/记忆系统/tools/`);
+    }
+
+    // 建索引
+    const VAULT2 = cwd;
+    const pages = (function () {
+      // 直接用内部 scanVault（此时 getVault() 常量已指向 cwd）
+      return [];
+    })();
+
+    console.log('');
+    console.log('✅ 初始化完成。');
+    console.log('');
+    console.log('下一步：');
+    console.log(`  node "${path.join(dstTools, 'mem.mjs')}" index    重建目录`);
+    console.log(`  node "${path.join(dstTools, 'mem.mjs')}" brief    看简报`);
+    console.log('');
+    console.log('提示：想在任何目录都能用，设置环境变量：');
+    console.log(`  MEM_VAULT=${cwd}`);
+    return;
+  }
+
+  if (cmd === 'index') {
+    const pages = scanVault();
+    const content = buildIndex(pages);
+    fs.mkdirSync(getSYS(), { recursive: true });
+    fs.writeFileSync(getIDX(), content + '\n', 'utf8');
+    console.log(`✓ pages.idx 已重建：${pages.length} 页`);
+    console.log(`  ${getIDX()}`);
+    const byKind = {};
+    for (const p of pages) byKind[p.kind] = (byKind[p.kind] || 0) + 1;
+    console.log('  分类：', JSON.stringify(byKind));
+    return;
+  }
+
+  if (cmd === 'recall') {
+    // 收集位置参数，跳过所有 --flag 及其值
+    // 注意：必须覆盖所有「带值的 flag」，否则它们的值会被当成查询词
+    // 统一走 parseArgs（不再各命令自己维护白名单）
+    const { positional } = parseArgs(3);
+    const q = positional.join(' ');
+    if (!q) {
+      console.error('缺少查询词');
+      process.exit(1);
+    }
+    const pages = scanVault();
+    const limit = parseInt(arg('limit', '12'), 10);
+    const minScore = parseFloat(arg('min-score', '2'));
+    const spread = hasFlag('spread');
+    const spreadLimit = parseInt(arg('spread-limit', '8'), 10);
+    const spreadMinRatio = parseFloat(arg('spread-min-ratio', '0.25'));
+
+    if (spread) {
+      const { direct, spread: spreads } = recallWithAssociation(q, pages, {
+        limit, minScore, spread, spreadLimit, spreadMinRatio,
+      });
+
+      if (direct.length === 0) {
+        console.log('（无直接命中，联想也就无从谈起）');
+        return;
+      }
+
+      console.log(`查询「${q}」\n`);
+      console.log(`── 直接命中 ${direct.length} 条 ──`);
+      for (const r of direct) {
+        console.log(`[${r.kind}] ${r.score.toFixed(2)}  ${r.path}`);
+        console.log(`    ${r.title}`);
+        if (r.cues.length) console.log(`    cues: ${r.cues.slice(0, 5).join(' | ')}`);
+      }
+
+      if (spreads.length) {
+        console.log(`\n── 联想扩散 ${spreads.length} 条（PPR，你没提但相关）──`);
+        for (const r of spreads) {
+          const tag = r.via === 'link' ? '链' : '义';
+          console.log(`[${r.kind}·${tag}] ${r.score.toFixed(2)}  ${r.path}`);
+          console.log(`    ${r.title}`);
+        }
+        console.log('\n（链 = 显式双链走到；义 = 语义相近但从未连过）');
+      } else {
+        console.log('\n（无联想项 —— 图里没有连通路径）');
+      }
+      return;
+    }
+
+    const results = recall(q, pages, { limit, minScore });
+
+    if (results.length === 0) {
+      console.log('（无命中）');
+      return;
+    }
+    console.log(`查询「${q}」→ ${results.length} 条命中\n`);
+    for (const r of results) {
+      console.log(`[${r.kind}] ${r.score.toFixed(2)}  ${r.path}`);
+      console.log(`    ${r.title}`);
+      if (r.cues.length) console.log(`    cues: ${r.cues.slice(0, 5).join(' | ')}`);
+      if (r.source) console.log(`    source: ${r.source}`);
+      if (r.superseded_by) console.log(`    ⚠ superseded by ${r.superseded_by}`);
+    }
+    return;
+  }
+
+  if (cmd === 'episode') {
+    const schema = arg('schema', '未分类');
+    const title = arg('title', null);
+
+    // 2026-11-18 修：原来不带任何参数也会静默创建一条「未分类/（待补充）」的空 Episode，
+    // 污染库且难追溯。规则：title 必填，否则拒绝创建。
+    if (!title || title === true) {
+      console.error('缺少 --title。Episode 必须有能一眼看懂是什么的标题。');
+      console.error('用法：node mem.mjs episode --schema "问题类型" --title "一句话" --cues "a;b" [--body-file F]');
+      process.exit(1);
+    }
+    const cuesRaw = arg('cues', '');
+    const project = arg('project', '未归属');
+    const salience = parseFloat(arg('salience', '0.5'));
+    const bodyFile = arg('body-file', null);
+
+    let body = '';
+    if (bodyFile && bodyFile !== true) {
+      body = fs.readFileSync(bodyFile, 'utf8');
+    } else {
+      body = arg('body', '（待补充）');
+    }
+
+    const cues = String(cuesRaw).split(';').map(s => s.trim()).filter(Boolean);
+    const outcome = arg('outcome', 'unknown');       // success | partial | failure | unknown
+
+    // ── 显式声明推翻（2026-11-18 新增，实现真·全自动）──
+    //
+    // 设计转折（第二次）：
+    //   第一版靠"cue 命中数"猜哪页该废 → 61 条真实数据实测误报 100%。
+    //   根因：检索相似 ≠ 语义推翻，规则无法区分。
+    //
+    //   第二版换思路：**不猜，让声明本身携带信息**。
+    //   写 Episode 时用 --refutes 明确说"我推翻了这几页"，
+    //   系统立即执行，零猜测、零误判。
+    //
+    //   这是真正的全自动：不需要人工 review，因为你已经用参数表达了裁决。
+    //
+    // 用法：
+    //   --refutes "路径1;路径2"              标 superseded_by（降权，可回退）
+    //   --refutes "路径1;路径2" --refute-hard  标 refuted（彻底废掉）
+    const refutesRaw = arg('refutes', null);
+    const refuteHard = hasFlag('refute-hard');
+    const lesson = arg('lesson', null);
+    const expectation = arg('expectation', null);    // "以为会发生什么"
+    const trustVal = arg('trust', 'verified');       // verified|reported|inferred|recalled
+    const corrRaw = arg('corrections', '');
+    const corrections = corrRaw && corrRaw !== true
+      ? String(corrRaw).split(';').map(s => s.trim()).filter(Boolean)
+      : [];
+
+    const r = createEpisode({
+      schema, title, cues, body, project, salience,
+      outcome, corrections, lesson, expectation,
+      trust: trustVal && trustVal !== true ? String(trustVal) : 'verified',
+    });
+    console.log(`✓ Episode 已创建`);
+    console.log(`  id:      ${r.id}`);
+    console.log(`  path:    ${r.relPath}`);
+    console.log(`  outcome: ${outcome}`);
+    if (expectation && expectation !== true) console.log(`  预期:    ${expectation}`);
+    if (lesson) console.log(`  lesson:  ${lesson}`);
+    if (corrections.length) console.log(`  纠错:    ${corrections.length} 条`);
+
+    // ── 执行显式声明推翻（全自动，零猜测）──
+    if (refutesRaw && refutesRaw !== true) {
+      const targets = String(refutesRaw).split(';').map(s => s.trim()).filter(Boolean);
