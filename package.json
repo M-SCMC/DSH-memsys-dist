@@ -1,0 +1,44 @@
+{
+  "name": "dsh-memsys",
+  "version": "1.0.0",
+  "description": "六层记忆系统 — 按人类大脑机制设计的 AI 记忆架构。会衰减、会联想、会记错、会认错。",
+  "keywords": [
+    "memory",
+    "ai",
+    "obsidian",
+    "markdown",
+    "knowledge-management",
+    "cognitive-architecture",
+    "llm",
+    "agent"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "memsys": "./tools/mem.mjs",
+    "memsys-setup": "./tools/setup.mjs"
+  },
+  "files": [
+    "tools/",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "init": "node tools/mem.mjs init --force",
+    "index": "node tools/mem.mjs index",
+    "brief": "node tools/mem.mjs brief",
+    "test": "node tools/test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/M-SCMC/DSH-memsys-dist.git"
+  },
+  "bugs": {
+    "url": "https://github.com/M-SCMC/DSH-memsys-dist/issues"
+  },
+  "homepage": "https://github.com/M-SCMC/DSH-memsys-dist#readme"
+}
