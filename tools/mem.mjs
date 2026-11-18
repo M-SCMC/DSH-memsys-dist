@@ -2041,3 +2041,504 @@ function findContradictions(pages) {
     if (p.refuted) continue;
 
     const title = p.title || path.basename(p.path, '.md');
+
+
+    // 找方向词
+    let dir = null, dirWord = null;
+    for (const [pos, neg] of OPPOSE_PAIRS) {
+      if (title.includes(neg)) { dir = 'neg'; dirWord = neg; break; }
+      if (title.includes(pos)) { dir = 'pos'; dirWord = pos; break; }
+    }
+    if (!dir) continue;
+
+    // 抽实体
+    const entities = new Set();
+    const opposeWords = new Set(OPPOSE_PAIRS.flat());
+    for (const re of ENTITY_PATTERNS) {
+      for (const m of title.matchAll(re)) {
+        if (!m[1]) continue;
+        let e = m[1].trim();
+        const el = e.toLowerCase();
+        if (el.length < 2) continue;
+        if (ENTITY_STOP.has(el)) continue;
+
+        // 修复（2026-11-18）：正则会把「选择方案」整体抓成实体，
+        // 导致「选择方案X」与「放弃方案X」提取出的实体分别是"选择"和"放弃"，
+        // 永远对不上，矛盾永远检不出。
+        // 解决：从提取结果里把方向词剔除，只留真正的名词部分。
+        for (const ow of opposeWords) {
+          if (e.includes(ow)) e = e.split(ow).join('');
+        }
+        if (e.length < 2) continue;
+        if (opposeWords.has(e)) continue;
+
+        entities.add(e.toLowerCase());
+      }
+    }
+    // 常见技术名词白名单（中文标题里的关键主体）
+    const KEY_TERMS = ['ida', 'ghidra', 'ida', 'reworkbench', 'onnx', 'ptx', 'birefnet',
+      'heal', 'dodgeburn', 'abpn', 'spotless', 'egsgenerator', 'comfyui', 'traecn',
+      '示例项目A', '抠图', '磨皮', '祛斑', '祛痘', '水印', '引擎', '模型', '插件'];
+    for (const t of KEY_TERMS) {
+      if (title.toLowerCase().includes(t)) entities.add(t);
+    }
+
+    if (entities.size) decisions.push({ page: p, dir, dirWord, entities });
+  }
+
+  // 按实体聚合
+  const byEntity = new Map();
+  for (const d of decisions) {
+    for (const e of d.entities) {
+      if (!byEntity.has(e)) byEntity.set(e, { pos: [], neg: [] });
+      byEntity.get(e)[d.dir].push(d);
+    }
+  }
+
+  for (const [entity, { pos, neg }] of byEntity) {
+    if (!pos.length || !neg.length) continue;
+
+    // 同一条自己的 pos/neg 不算（比如"选了 X 放弃 Y"同时含两个词）
+    for (const a of pos) {
+      for (const b of neg) {
+        if (a.page.path === b.page.path) continue;
+
+        const alreadyLinked =
+          (a.page.superseded_by && (b.page.path.includes(a.page.superseded_by) || a.page.path.includes(a.page.superseded_by))) ||
+          (b.page.superseded_by && (a.page.path.includes(b.page.superseded_by) || b.page.path.includes(b.page.superseded_by)));
+
+        conflicts.push({
+          type: 'A-方向相反',
+          subject: entity,
+          severity: alreadyLinked ? 'resolved' : 'open',
+          a: { path: a.page.path, title: a.page.title, word: a.dirWord },
+          b: { path: b.page.path, title: b.page.title, word: b.dirWord },
+          note: alreadyLinked ? '已有 superseded 链' : '未见 superseded 关系，需人工确认哪条过时',
+        });
+      }
+    }
+  }
+
+  // ── B 类：同一参数出现两个不同数值 ──
+  // 在 decision 页里找 "参数名 = 数值" 或 "参数名：数值" 模式
+  const paramMap = new Map();
+  for (const p of pages) {
+    if (p.kind !== 'decision') continue;
+    if (p.refuted) continue;
+    let body;
+    try { body = fs.readFileSync(path.join(getVault(), p.path), 'utf8'); } catch { continue; }
+
+    // 例：threshold=0.35、thr_low 0.35、padding 192
+    for (const m of body.matchAll(/([A-Za-z_][A-Za-z0-9_]{2,20})\s*[=＝:：]\s*(-?\d+(?:\.\d+)?)/g)) {
+      const key = m[1].toLowerCase();
+      const val = parseFloat(m[2]);
+      if (!isFinite(val)) continue;
+      if (!paramMap.has(key)) paramMap.set(key, new Map());
+      const valMap = paramMap.get(key);
+      if (!valMap.has(val)) valMap.set(val, []);
+      valMap.get(val).push(p.path);
+    }
+  }
+
+  for (const [key, valMap] of paramMap) {
+    if (valMap.size < 2) continue;
+    // 只报在不同页里出现的不同值
+    const entries = [...valMap.entries()].filter(([, ps]) => ps.length > 0);
+    if (entries.length < 2) continue;
+    const pagesPerVal = entries.map(([v, ps]) => ({ val: v, pages: [...new Set(ps)] }));
+    // 至少两个值各自出现在不同页面
+    const distinct = pagesPerVal.filter(e => e.pages.length);
+    if (distinct.length >= 2) {
+      conflicts.push({
+        type: 'B-参数不一致',
+        subject: key,
+        severity: 'info',
+        values: distinct.slice(0, 4).map(e => ({ value: e.val, pages: e.pages.slice(0, 2) })),
+        note: '不同页面对同一参数用了不同值，可能合法（不同场景）也可能过时',
+      });
+    }
+  }
+
+  return conflicts;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 开场简报（L1 工作记忆的入口，目标 < 500 token）
+// ─────────────────────────────────────────────────────────────
+
+function brief({ days = 7, withGraph = false, checkContradictions = true } = {}) {
+  const pages = scanVault();
+  const actMap = activationMap();
+  const now = Date.now();
+  const cutoff = Math.floor((now - days * 86400000) / 1000);
+
+  const lines = [];
+
+  // ① 库概览
+  const byKind = {};
+  for (const p of pages) byKind[p.kind] = (byKind[p.kind] || 0) + 1;
+  const kk = ['project', 'decision', 'procedure', 'episode', 'fact', 'record']
+    .filter(k => byKind[k])
+    .map(k => `${k}:${byKind[k]}`)
+    .join(' ');
+  lines.push(`▸ 库 ${pages.length} 页（${kk}）`);
+
+  // ② 最近变化（按 mtime）——只挑信息密度高的类，跳过 record 与索引
+  const NOISE_KINDS = new Set(['record', 'index']);
+  const recentAll = pages.filter(p => p.mtime >= cutoff && !NOISE_KINDS.has(p.kind));
+  const recent = recentAll
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, 6);
+  if (recent.length) {
+    lines.push('');
+    lines.push(`▸ 近 ${days} 天改动 ${recentAll.length} 页（已滤掉会话档案/索引），最新：`);
+    for (const p of recent) {
+      const d = new Date(p.mtime * 1000);
+      const stamp = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      lines.push(`  ${stamp} [${p.kind}] ${truncate(p.title, 42)}`);
+    }
+  }
+
+  // ③ 最近 Episode（未蒸馏的优先）
+  const eps = pages
+    .filter(p => p.kind === 'episode')
+    .sort((a, b) => b.mtime - a.mtime);
+  const rawEps = eps.filter(e => e.status === 'raw');
+  if (eps.length) {
+    lines.push('');
+    lines.push(`▸ 情景记忆 ${eps.length} 条（未蒸馏 ${rawEps.length}）`);
+    for (const e of eps.slice(0, 3)) {
+      const flag = e.status === 'raw' ? '·未蒸馏' : '';
+      lines.push(`  ${truncate(e.title, 44)}${flag}`);
+    }
+  }
+
+  // ④ 程序性记忆：只列 trigger，不列正文（只认 P-\d{4} 编号的，跳过索引页）
+  const realProcs = pages.filter(
+    p => p.kind === 'procedure' && /^P-\d{4}/.test(path.basename(p.path))
+  );
+  if (realProcs.length) {
+    lines.push('');
+    lines.push(`▸ 程序记忆 ${realProcs.length} 条（遇到同类任务先对 trigger）：`);
+    for (const p of realProcs) {
+      const id = path.basename(p.path, '.md').split('-').slice(0, 2).join('-');
+      lines.push(`  ${id} ${truncate(p.title, 34)}`);
+    }
+  }
+
+  // ⑤ 高活化页（用过的）
+  const topAct = [...actMap.entries()]
+    .map(([p, a]) => ({ path: p, a }))
+    .sort((x, y) => y.a - x.a)
+    .slice(0, 3);
+  if (topAct.length) {
+    lines.push('');
+    lines.push('▸ 最近用过的：');
+    for (const t of topAct) {
+      lines.push(`  ${truncate(path.basename(t.path, '.md'), 50)} (A=${t.a.toFixed(2)})`);
+    }
+  }
+
+  // ⑥ 待处理
+  const issues = [];
+  if (rawEps.length >= 5) issues.push(`raw Episode 堆积 ${rawEps.length} 条，该蒸馏`);
+  // 注意：检查的是 trust（可信度），不是 source（出处）。
+  // 2026-11-18 修：这里原来查 source，但 source 是出处语义、82 页都有，
+  // 这个检查从来没意义，还在 brief 里谎报「26 条缺 source」。
+  const noTrust = pages.filter(p => ['decision', 'fact'].includes(p.kind) && !p.trust).length;
+  if (noTrust) issues.push(`${noTrust} 条语义页未标可信度 trust`);
+
+  // ⑥' 即时矛盾扫描（不依赖用户或周审计触发）
+  //
+  // 修复（2026-11-18，用户要求）：原来矛盾扫描只在每周审计里跑，
+  // 等于允许错误存活最多七天；这期间所有基于它的推理都是错的。
+  // 现在每轮 brief 都扫一遍——成本约 0.3 秒，收益是错误当轮就能被发现。
+  if (checkContradictions) {
+    try {
+      const conflicts = findContradictions(pages);
+      const open = conflicts.filter(c => c.severity === 'open');
+      if (open.length) {
+        issues.push(`🔴 ${open.length} 处未处理的矛盾（详见 contradictions）`);
+        for (const c of open.slice(0, 3)) {
+          issues.push(`   · ${c.subject}: ${c.a.word} vs ${c.b.word}`);
+        }
+      }
+    } catch (e) {
+      issues.push(`矛盾扫描失败：${e.message}`);
+    }
+  }
+
+  // ⑥'' 待裁决的自动检出冲突（新 Episode 说旧结论错了，但还没人裁决）
+  try {
+    const cf = path.join(getSYS(), 'proposals', '冲突待裁决.md');
+    if (fs.existsSync(cf)) {
+      const txt = fs.readFileSync(cf, 'utf8');
+      const pending = (txt.match(/^- \[ \]/gm) || []).length;
+      if (pending > 0) {
+        issues.push(`🟠 ${pending} 条自动检出的冲突待裁决（proposals/冲突待裁决.md）`);
+      }
+    }
+  } catch { /* 忽略 */ }
+
+  if (issues.length) {
+    lines.push('');
+    lines.push('▸ 待处理：');
+    for (const i of issues) lines.push('  ' + i);
+  }
+
+  // ⑦ 图健康度（联想能力才存在的前提）
+  if (withGraph) {
+    const g = buildGraph(pages);
+    const totalEdges = g.adj.reduce((s, e) => s + e.length, 0) / 2;
+    const isolated = g.adj.filter(e => e.length === 0).length;
+    lines.push('');
+    lines.push(`▸ 联想图：${Math.round(totalEdges)} 条边，孤立节点 ${isolated} 个（${(isolated / pages.length * 100).toFixed(0)}%）`);
+    if (isolated / pages.length > 0.3) {
+      lines.push('  ⚠ 孤立节点占比高，联想能力受限。补 [[双链]] 可显著改善。');
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function truncate(s, n) {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  return s.length <= n ? s : s.slice(0, n - 1) + '…';
+}
+
+/** 从路径推断所属项目（10-项目/<名>/ 或 40-归档/.../<名>/） */
+function projectOf(p) {
+  const m = p.match(/^10-项目\/([^/]+)\//);
+  if (m) return m[1];
+  const a = p.match(/^40-归档\/[^/]+\/([^/]+)\//);
+  if (a) return a[1];
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// CLI
+// ─────────────────────────────────────────────────────────────
+
+function arg(name, def = null) {
+  const i = process.argv.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const v = process.argv[i + 1];
+  return v && !v.startsWith('--') ? v : true;
+}
+
+function hasFlag(name) {
+  return process.argv.includes(`--${name}`);
+}
+
+function main() {
+  const cmd = process.argv[2];
+
+  if (!cmd) {
+    console.log(`mem.mjs — DSH 记忆系统
+
+用法：
+  node mem.mjs brief                        开场简报（新会话第一个命令）
+  node mem.mjs index                        重建 pages.idx
+  node mem.mjs recall "查询词" [--spread]    召回；--spread 启用联想扩散
+  node mem.mjs mark <path>...               标记「这页真用上了」（强化记忆）
+  node mem.mjs episode --schema X --title Y --cues "a;b"
+          [--outcome success|partial|failure] [--lesson "一句话"]
+          [--corrections "错的点1;错的点2"]
+  node mem.mjs distill [--apply]            夜间蒸馏（产出失败台账/经验池/提案）
+  node mem.mjs compact [--apply]            季度压缩
+  node mem.mjs audit                        健康检查
+  node mem.mjs stats                        统计
+
+环境变量：
+  MEM_VAULT   库根目录，默认 ${getVault()}
+
+关键改动（2026-11-18）：
+  · 活化度改半衰期形式（30 天），修「1 小时前访问也算死」的量级错
+  · recall 不再自动强化记忆；只有 mark 过的才算「用过」
+  · Episode 新增 outcome / corrections / lesson，支撑自我纠错
+  · distill 真正产出 failures.md / lessons.md / proposals/
+`);
+    process.exit(0);
+  }
+
+  if (cmd === 'brief') {
+    const days = parseInt(arg('days', '7'), 10);
+    console.log(brief({ days, withGraph: hasFlag('graph') }));
+    return;
+  }
+
+  if (cmd === 'contradictions') {
+    const pages = scanVault();
+    const conflicts = findContradictions(pages);
+    const open = conflicts.filter(c => c.severity === 'open');
+    const resolved = conflicts.filter(c => c.severity === 'resolved');
+    const info = conflicts.filter(c => c.severity === 'info');
+
+    console.log(`矛盾扫描：${conflicts.length} 项（未处理 ${open.length} / 已处理 ${resolved.length} / 待判断 ${info.length}）`);
+
+    if (open.length) {
+      console.log('\n── 🔴 未处理的矛盾（需人工裁决）──');
+      for (const c of open) {
+        console.log(`\n[${c.type}] 主体：${c.subject}`);
+        console.log(`  ① [${c.a.word}] ${c.a.title}`);
+        console.log(`     ${c.a.path}`);
+        console.log(`  ② [${c.b.word}] ${c.b.title}`);
+        console.log(`     ${c.b.path}`);
+        console.log(`  → ${c.note}`);
+        console.log(`  处置：确认哪条错，给它加 refuted: true + refuted_reason`);
+      }
+    }
+
+    if (resolved.length) {
+      console.log('\n── 🟡 已有 superseded 链（可能已处理）──');
+      for (const c of resolved) {
+        console.log(`  ${c.subject}：${path.basename(c.a.path, '.md').slice(0, 30)} ↔ ${path.basename(c.b.path, '.md').slice(0, 30)}`);
+      }
+    }
+
+    if (info.length) {
+      console.log('\n── ⚪ 参数不一致（可能合法）──');
+      for (const c of info.slice(0, 10)) {
+        console.log(`  ${c.subject}: ${c.values.map(v => `${v.value}(${v.pages.length}页)`).join(' vs ')}`);
+      }
+      if (info.length > 10) console.log(`  …还有 ${info.length - 10} 项`);
+    }
+
+    return;
+  }
+
+  if (cmd === 'rollback') {
+    // 回滚自动改动（2026-11-18 新增）
+    //
+    // 为什么必须有：自动纠错万一标错了，必须能一键撤销。
+    // 没有回滚能力的自动化 = 定时炸弹。
+    //
+    // 用法：
+    //   rollback --list              列出所有自动改动过的页
+    //   rollback --all --apply       撤销全部自动改动
+    //   rollback <path> --apply      只撤销某一页
+    const listOnly = hasFlag('list');
+    const doAll = hasFlag('all');
+    const apply = hasFlag('apply');
+    const targetPath = process.argv.slice(3).find(a => !a.startsWith('--'));
+
+    const log = readLog();
+    const autoChanges = log.filter(e => e.op === 'supersede' && e.auto === true);
+
+    if (listOnly || (!apply && !targetPath && !doAll)) {
+      if (autoChanges.length === 0) {
+        console.log('没有自动改动过任何页。');
+        return;
+      }
+      console.log(`自动改动记录：${autoChanges.length} 条\n`);
+      const byPath = new Map();
+      for (const e of autoChanges) {
+        if (!byPath.has(e.path)) byPath.set(e.path, []);
+        byPath.get(e.path).push(e);
+      }
+      for (const [p, es] of byPath) {
+        console.log(`${p}`);
+        console.log(`  被 ${es.length} 次自动标记，最近一次 by ${es[es.length - 1].by}`);
+        const bak = es[es.length - 1].backup;
+        if (bak) console.log(`  备份：${bak}`);
+      }
+      console.log('\n撤销全部：node mem.mjs rollback --all --apply');
+      return;
+    }
+
+    const targets = doAll
+      ? [...new Set(autoChanges.map(e => e.path))]
+      : (targetPath ? [targetPath] : []);
+
+    if (targets.length === 0) {
+      console.error('没有指定回滚目标。用 --all 或给一个路径。');
+      process.exit(1);
+    }
+
+    if (!apply) {
+      console.log(`[dry-run] 将回滚 ${targets.length} 页：`);
+      for (const t of targets) console.log('  ' + t);
+      console.log('\n加 --apply 执行。');
+      return;
+    }
+
+    let done = 0, skipped = 0;
+    for (const t of targets) {
+      const full = path.join(getVault(), t);
+      if (!fs.existsSync(full)) { skipped++; continue; }
+
+      const txt = fs.readFileSync(full, 'utf8');
+      const fi = txt.indexOf('\n---', 3);
+      if (fi === -1) { skipped++; continue; }
+
+      const fm = txt.slice(3, fi);
+      // 2026-11-18 三次修正：可回滚的标记有三类
+      //   1. auto_superseded      系统按规则自动标的（已废弃，仅兼容旧数据）
+      //   2. confirmed_by_human   review --confirm 标的
+      //   3. explicit_refute      episode --refutes 显式声明标的
+      // 漏掉第 3 类会导致「全自动纠错」标错了没法撤销。
+      const isAuto = /^auto_superseded:\s*true/m.test(fm);
+      const isHuman = /^confirmed_by_human:\s*true/m.test(fm);
+      const isExplicit = /^explicit_refute:\s*true/m.test(fm);
+      if (!isAuto && !isHuman && !isExplicit) {
+        skipped++;
+        continue;
+      }
+
+      const kept = fm.split('\n').filter(l =>
+        !/^superseded_by:/.test(l) &&
+        !/^auto_superseded:/.test(l) &&
+        !/^confirmed_by_human:/.test(l) &&
+        !/^explicit_refute:/.test(l) &&
+        !/^refuted:/.test(l) &&
+        !/^refuted_by:/.test(l) &&
+        !/^refuted_reason:/.test(l)
+      ).join('\n');
+
+      fs.writeFileSync(full, '---' + kept + txt.slice(fi), 'utf8');
+      const kind = isAuto ? '自动' : isHuman ? '人工确认' : '显式声明';
+      appendLog({ op: 'rollback', path: t, was: kind });
+      done++;
+      console.log(`✓ 已回滚 ${t}（${kind}标记）`);
+    }
+
+    console.log(`\n回滚 ${done} 页，跳过 ${skipped} 页（不存在或非自动标记）`);
+    return;
+  }
+
+  if (cmd === 'review') {
+    // 一键裁决（2026-11-18 新增）
+    //
+    // 设计转折：
+    //   原计划"自动纠错"，但用 61 条真实记录评估后发现误报率 100%——
+    //   "检索到相关页"和"这页该被推翻"是两件事，无法用规则自动判断。
+    //
+    //   所以改成：系统自动准备好**可执行的动作**，人只需一句话确认。
+    //   从"人要不要动手写命令"→"人说对还是不对"。
+    //
+    // 用法：
+    //   review                    看当前待裁决清单
+    //   review --confirm 1,3      确认第 1、3 条（执行 supersede）
+    //   review --reject 2         拒绝第 2 条（从清单移除）
+    //   review --clear            清空清单
+    const cf = path.join(getSYS(), 'proposals', '冲突待裁决.md');
+    if (!fs.existsSync(cf)) {
+      console.log('没有待裁决项。');
+      return;
+    }
+
+    const txt = fs.readFileSync(cf, 'utf8');
+
+    // 解析成结构化条目
+    const blocks = txt.split(/^## /m).slice(1);
+    const entries = [];
+    for (const b of blocks) {
+      const head = b.split('\n')[0];
+      const byMatch = head.match(/由\s+(EP-[\w-]+)/);
+      const newClaim = (b.match(/\*\*新结论\*\*：(.+)/) || [])[1];
+      const items = [...b.matchAll(/^- \[ \] `([^`]+)`\n\s+(.+?)（/gm)]
+        .map(m => ({ path: m[1], title: m[2].trim() }));
+      if (items.length) {
+        entries.push({ header: head, by: byMatch?.[1], claim: newClaim, items });
+      }
+    }
