@@ -538,3 +538,504 @@ function activationMap() {
   const out = new Map();
   for (const [p, times] of byPath) out.set(p, activation(times));
   return out;
+
+}
+
+// ─────────────────────────────────────────────────────────────
+// 检索（编码特异性 + 三因子打分）
+// ─────────────────────────────────────────────────────────────
+
+// 中文高频虚词：不作为检索 token，否则淹没所有结果
+const CJK_STOP = new Set(
+  '的 了 是 在 我 有 和 就 不 人 都 一 一个 上 也 很 到 说 要 去 你 会 着 没有 看 好 自己 这 那 什么 怎么 为什么 因为 所以 但 但是 如果 可以 需要 进行 通过 以及 或者 还有 这个 那个 我们 他们 它 与 及 等 中 下 后 前 时 用 被 把 给 对 从 向 里 外 上 内 个 那些 这些 之 而 其 于 以 为 于 即 则 所 由 并'.split(/\s+/)
+);
+
+function isCjk(s) {
+  return /[\u4e00-\u9fa5]/.test(s);
+}
+
+function tokenize(q) {
+  const s = q.toLowerCase().trim();
+  const tokens = new Set();
+  if (!s) return { phrase: '', tokens: [] };
+
+  // 英文/数字词（>=2 字符）
+  for (const m of s.matchAll(/[a-z0-9_+#.]{2,}/g)) {
+    const w = m[0];
+    if (!CJK_STOP.has(w)) tokens.add(w);
+  }
+
+  // 中文：只取 2-gram 和 3-gram，不取单字（单字噪声太大）
+  const cjk = s.replace(/[^\u4e00-\u9fa5]/g, '');
+  for (let n = 2; n <= 3; n++) {
+    for (let i = 0; i + n <= cjk.length; i++) {
+      const g = cjk.slice(i, i + n);
+      if (!CJK_STOP.has(g)) tokens.add(g);
+    }
+  }
+
+  return { phrase: s, tokens: [...tokens] };
+}
+
+/**
+ * 打分：覆盖率主导 + IDF 加权质量
+ *
+ * 核心修正（2026-11-18）：
+ * 之前用加法聚合 token 命中，导致"崩溃"这种高频词能靠单点命中拉满分数。
+ * 现在改为：覆盖率（命中 token 数 / 查询 token 数）作为幂次乘数，
+ * 命中 1/4 的文档与命中 4/4 的文档差距 ≥ 16 倍。
+ *
+ * 依据：编码特异性（Tulving & Thomson 1973）——
+ * 线索必须与编码时匹配，匹配得越完整越可信。
+ */
+function scorePage(p, q, df, totalDocs) {
+  const { phrase, tokens } = q;
+  const titleL = p.title.toLowerCase();
+  const pathL = p.path.toLowerCase();
+  const previewL = p.preview.toLowerCase();
+  const cuesL = p.cues.map(c => c.toLowerCase());
+
+  // ① 线索精确匹配（最强信号，直接加分不参与覆盖率计算）
+  let cueBonus = 0;
+  for (const cl of cuesL) {
+    if (phrase && cl === phrase) cueBonus += 40;
+    else if (phrase && phrase.length >= 2 && (cl.includes(phrase) || phrase.includes(cl))) cueBonus += 15;
+  }
+
+  // ② 短语整体命中标题 / 路径
+  let phraseBonus = 0;
+  if (phrase && phrase.length >= 2) {
+    if (titleL.includes(phrase)) phraseBonus += 30;
+    if (pathL.includes(phrase)) phraseBonus += 18;
+  }
+
+  // ③ 逐 token 计算命中质量
+  let matched = 0;
+  let qualitySum = 0;
+
+  for (const t of tokens) {
+    const dfv = df.get(t) || 1;
+    const idf = Math.log(1 + totalDocs / dfv);
+
+    let quality = 0;
+    if (titleL.includes(t)) quality = 30 + 10 * idf;
+    else if (pathL.includes(t)) quality = 20 + 7 * idf;
+    else if (cuesL.some(c => c.includes(t))) quality = 15 + 6 * idf;
+    else if (previewL.includes(t)) quality = 2 * idf;
+
+    if (quality > 0) {
+      matched += 1;
+      const isProper = /^[a-z0-9_+#.]{2,}$/.test(t) || /\d/.test(t);
+      qualitySum += quality * (isProper ? 1.6 : 1.0);
+    }
+  }
+
+  if (matched === 0 && cueBonus === 0 && phraseBonus === 0) return 0;
+
+  const coverage = tokens.length > 0 ? matched / tokens.length : (phrase ? 1 : 0);
+  const coverageWeight = Math.min(tokens.length / 3, 1);
+  const coverageScore = Math.pow(coverage, 2) * 100 * coverageWeight;
+
+  let segmentBonus = 0;
+  for (const seg of p.path.split('/').slice(0, -1)) {
+    const segL = seg.toLowerCase();
+    if (phrase && phrase.length >= 2 && segL.includes(phrase)) {
+      segmentBonus = Math.max(segmentBonus, 25);
+    }
+  }
+
+  let score = qualitySum + coverageScore + cueBonus + phraseBonus + segmentBonus;
+
+  // ⑤ 类型权重
+  const kw = KIND_WEIGHT[p.kind] ?? 0.5;
+  score *= kw;
+
+  // ⑥ 新近权重（recency）：新观点优先于老观点
+  //
+  // 依据：Murdock (1962) 近因效应 + Anderson & Schooler (1991) 需求概率里
+  //       新近度是三大因子之一。人的记忆里，刚学到的东西比多年前的更可信。
+  //
+  // 语义页（decision/fact/project）用半衰期 1 年：
+  //   · 1 天内  → ×1.00
+  //   · 3 个月  → ×0.84
+  //   · 1 年    → ×0.50
+  //   · 3 年    → ×0.13
+  // 太老的结论即使文本匹配度一样，也应排在新结论之后。
+  //
+  // 但不压到 0：老的金科玉律（如 路径含中文导致崩溃）依然要能被搜到，
+  // 只是同分时让位给新的。所以下限设 0.15，不归零。
+  const RECENCY_HALFLIFE_DAYS = 365;
+  const ageDays = (Date.now() - p.mtime * 1000) / 86400000;
+  let recency = Math.pow(0.5, Math.max(0, ageDays) / RECENCY_HALFLIFE_DAYS);
+  recency = Math.max(recency, 0.15);   // 下限：老知识不消失
+  score *= recency;
+
+  // ⑥' 重要性权重（salience）
+  //
+  // 修复（2026-11-18）：salience 字段建了很久，但打分里从来没用过——
+  // 又一个"建了不接线"的死字段。用户手标的「这条很重要」等于白标。
+  //
+  // 映射：salience 0.5 为中性（×1.0），1.0 为最高（×1.5），0 为最低（×0.5）
+  if (typeof p.salience === 'number' && p.salience !== null) {
+    const s = Math.max(0, Math.min(1, p.salience));
+    score *= (0.5 + s);   // 0→0.5, 0.5→1.0, 1.0→1.5
+  }
+
+  // ⑥'' 程序记忆的实证表现
+  //
+  // 修复（2026-11-18）：times_applied / success_rate 建了但从不更新、也从不接线。
+  // 现在至少让"成功率"参与排序——屡次失败的老流程不该排在前面。
+  if (p.kind === 'procedure' && p.success_rate !== null && p.times_applied > 0) {
+    // 成功率 0.5 以下开始明显降权，1.0 保持原值
+    const sr = Math.max(0, Math.min(1, p.success_rate));
+    score *= (0.4 + 0.6 * sr);   // 0→0.4, 0.5→0.7, 1.0→1.0
+  }
+
+  // ⑦ superseded 降权（提取诱发遗忘：被取代的旧结论主动压制）
+  // ⑧ refuted 直接排除（错的信念彻底弃用，不是降权）
+  //
+  // 区分（2026-11-18）：
+  //   superseded → 0.2 倍，还能被搜到（"当时是这么想的"）
+  //   refuted    → 0 倍，完全不出现（"这条是错的，不要再用"）
+  // 对应人类：过时的知识偶尔还能想起来，但错的信念会被彻底弃用。
+  if (p.refuted) return 0;
+  if (p.superseded_by) score *= 0.2;
+
+  // ⑨ 已归档降权（Episode 例外）
+  if (p.path.startsWith('40-归档/') && !p.path.includes('/episodes/')) score *= 0.7;
+
+  return score;
+}
+
+/** 计算文档频率（用于 IDF） */
+function buildDF(pages, tokens) {
+  const df = new Map();
+  for (const t of tokens) {
+    let n = 0;
+    for (const p of pages) {
+      if (
+        p.title.toLowerCase().includes(t) ||
+        p.path.toLowerCase().includes(t) ||
+        p.preview.toLowerCase().includes(t)
+      ) n++;
+    }
+    df.set(t, Math.max(n, 1));
+  }
+  return df;
+}
+
+function recall(query, pages, opts = {}) {
+  const limit = opts.limit ?? 12;
+  const minScore = opts.minScore ?? 2;
+  const q = tokenize(query);
+  if (q.tokens.length === 0 && !q.phrase) return [];
+
+  const df = buildDF(pages, q.tokens);
+  const actMap = activationMap();
+
+  const scored = [];
+  for (const p of pages) {
+    let s = scorePage(p, q, df, pages.length);
+    if (s <= 0) continue;
+    const act = actMap.get(p.path) ?? 0;
+    s *= 1 + Math.min(act, 5) * 0.12;
+    if (s >= minScore) scored.push({ ...p, score: s });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, limit);
+
+  // 注意：这里不再写 recall 日志。
+  //
+  // 原因（2026-11-18 修）：原来「检索到」就算「用过」，导致
+  //   - 召回 12 条、我实际只用 1 条，12 条全部被强化
+  //   - 反复召回同一批页面会把它们的活化度刷到虚高
+  //   - 活化度本应反映"这个知识真的被需要过"，不是"被列表出来过"
+  //
+  // 改为：只有调用方显式确认使用了某页时，才记 `used` 事件。
+  // 见 markUsed()。人类记忆也是这样——想起 10 个候选，只有真正用上的那个被巩固。
+  return top;
+}
+
+/** 显式标记"这一页真的被用上了"，这才是强化记忆的正确信号 */
+function markUsed(paths, query = '') {
+  for (const p of paths) {
+    appendLog({ op: 'used', path: p, q: query });
+  }
+}
+
+/**
+ * 记录一次 procedure 的实战结果（2026-11-18 新增）
+ *
+ * 解决的问题：times_applied / success_rate 建了很久，
+ * 但全代码库没有任何写入点——procedure 的实战统计永远是初始值，
+ * 导致「屡次失败的老流程」和「刚写的新流程」在打分上没区别，
+ * 失效流程永远淘汰不掉。
+ *
+ * 人类对应：程序性记忆靠反复使用被强化，靠反复失败被废弃。
+ * 不记成败，就学不会「这条路走不通」。
+ *
+ * @param notes 叶节点路径（30-习惯/procedures/P-xxxx.md）
+ * @param ok    true = 成功，false = 失败
+ */
+function recordProcedureUse(notePath, ok, { note = '' } = {}) {
+  const full = path.join(getVault(), notePath);
+  if (!fs.existsSync(full)) return { ok: false, reason: '文件不存在' };
+
+  let text = fs.readFileSync(full, 'utf8');
+  const i = text.indexOf('\n---', 3);
+  if (i === -1) return { ok: false, reason: '无 frontmatter' };
+
+  let fm = text.slice(3, i);
+  const body = text.slice(i);
+
+  const getNum = (key) => {
+    const m = fm.match(new RegExp(`^${key}:\\s*([\\d.]+)`, 'm'));
+    return m ? parseFloat(m[1]) : null;
+  };
+
+  const prevTimes = Math.floor(getNum('times_applied') ?? 0);
+  const prevRate = getNum('success_rate');
+
+  const newTimes = prevTimes + 1;
+  // 增量式成功率：既考虑历史，也考虑这一次
+  const prevSucc = prevRate === null ? null : prevRate * prevTimes;
+  const newRate = prevSucc === null
+    ? (ok ? 1 : 0)
+    : (prevSucc + (ok ? 1 : 0)) / newTimes;
+
+  const setField = (key, val) => {
+    const re = new RegExp(`^${key}:.*$`, 'm');
+    if (re.test(fm)) fm = fm.replace(re, `${key}: ${val}`);
+    else fm = fm.replace(/\s*$/, '') + `\n${key}: ${val}`;
+  };
+
+  setField('times_applied', newTimes);
+  setField('success_rate', Math.round(newRate * 100) / 100);
+  setField('last_applied', JSON.stringify(new Date().toISOString().slice(0, 10)));
+
+  if (note) {
+    // 追加到「使用记录」表末尾
+    const stamp = new Date().toISOString().slice(0, 10);
+    const row = `| ${stamp} | ${note} | ${ok ? '成功' : '失败'} | |`;
+    if (/## 使用记录/.test(body)) {
+      text = '---' + fm + body.replace(/(\|[^\n]*\n)(\s*$)/, `$1${row}\n$2`);
+    } else {
+      text = '---' + fm + body + `\n\n## 使用记录\n\n| 日期 | 场景 | 结果 | 备注 |\n|---|---|---|---|\n${row}\n`;
+    }
+  } else {
+    text = '---' + fm + body;
+  }
+
+  fs.writeFileSync(full, text, 'utf8');
+  appendLog({ op: 'procedure_use', path: notePath, ok });
+
+  return {
+    ok: true,
+    times: newTimes,
+    rate: Math.round(newRate * 100) / 100,
+    prevTimes,
+    prevRate,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 情景记忆：写 Episode
+// ─────────────────────────────────────────────────────────────
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function nowParts() {
+  const d = new Date();
+  return {
+    y: d.getFullYear(),
+    m: pad2(d.getMonth() + 1),
+    d: pad2(d.getDate()),
+    hh: pad2(d.getHours()),
+    mm: pad2(d.getMinutes()),
+    ss: pad2(d.getSeconds()),
+    iso: d.toISOString(),
+  };
+}
+
+function createEpisode({ schema, title, cues, body, project, salience, outcome, corrections, lesson, expectation, trust }) {
+  const t = nowParts();
+  const dir = path.join(getEpisodeDir(), `${t.y}-${t.m}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const rand = crypto.randomBytes(2).toString('hex').toUpperCase();
+  const id = `EP-${t.y}${t.m}${t.d}-${t.hh}${t.mm}-${rand}`;
+  const file = path.join(dir, `${id}.md`);
+
+  const fm = {
+    type: 'episode',
+    id,
+    when: `${t.y}-${t.m}-${t.d}T${t.hh}:${t.mm}:${t.ss}+08:00`,
+    schema: schema || '未分类',
+    project: project || '未归属',
+    salience: salience ?? 0.5,
+    status: 'raw',
+
+    // 可信度（2026-11-18 补接线）
+    // 之前 CLI 收了 --trust 参数但 createEpisode 没写进 frontmatter，
+    // 导致 11 条 Episode 全部缺 trust —— 又一次「建了不接线」。
+    trust: trust || 'verified',   // Episode 是亲历记录，默认 verified
+
+    // ── 自我进化字段（2026-11-18 新增）──
+    // 人类记忆不只存"发生了什么"，还存"这事成没成、错在哪、学到什么"。
+    // 没有这三个字段，系统就记不住自己犯过的错，必然重复犯错。
+    outcome: outcome || 'unknown',      // success | partial | failure | unknown
+
+    // ── 预期校验（2026-11-18 新增）──
+    //
+    // 解决的问题：contradictions 只能抓"形式矛盾"（A 说要 X，B 说不要 X），
+    // 抓不出"这条结论本身算错了"——比如活化度公式量级错 100 倍，
+    // 库里只有一份公式，没有矛盾，它只是错的。
+    //
+    // 人类靠什么发现这种错？靠"用起来不对"：以为会保留，结果被压了。
+    // 所以让系统显式写下"我以为会发生什么"，事后对照，不符即信号。
+    expectation: expectation || null,   // "以为会发生什么"
+    expectation_held: null,             // true | false | null（未校验）
+
+    corrections: corrections || [],    // 用户或自己纠错过的点
+    lesson: lesson || null,            // 一句话经验（可蒸馏成 procedure）
+
+    cues: cues || [],
+
+    // derived_from：这条 Episode 读了哪些旧页
+    //
+    // ⚠ 2026-11-18 明确决定「暂不接线」：
+    //   蒸馏只产出提案、不自动改语义页，所以没有可信的回填来源。
+    //   硬填等于伪造溯源，比空着更糟。
+    //   等蒸馏真能自动合并内容时再启用。
+    //   检查工具 check-wiring.mjs 会把这条报为「只写不读」，属预期状态。
+    derived_from: [],
+    superseded_by: null,
+  };
+
+  const content = [
+    serializeFrontmatter(fm),
+    '',
+    `# ${title || id}`,
+    '',
+    body || '（待补充）',
+    '',
+  ].join('\n');
+
+  fs.writeFileSync(file, content, 'utf8');
+  appendLog({ op: 'episode', path: rel(file), id, outcome: fm.outcome });
+
+  // ── 自动冲突检测（2026-11-18，用户要求「让系统自动去做」）──
+  //
+  // 解决的问题：原来的链路是「人发现旧结论错了 → 人跑 refute → 系统执行」。
+  // 第一步依赖人，系统自己不会发现。现在改成：
+  //   新 Episode 一落盘，立刻拿它的 cues 反查库里的相关页，
+  //   把「可能被这条新结论影响」的旧页列出来，写进冲突待裁决清单。
+  //
+  // 系统自己发现，人只做最后裁决。
+  let conflicts = [];
+  try {
+    conflicts = detectConflictsForEpisode({ id, relPath: rel(file), cues, title, body, outcome: fm.outcome });
+  } catch (e) {
+    // 检测失败不影响 Episode 落盘本身
+    conflicts = [{ error: e.message }];
+  }
+
+  return { id, file, relPath: rel(file), conflicts };
+}
+
+/**
+ * 为一个新 Episode 检测它可能推翻/影响哪些旧结论。
+ *
+ * 判据（不依赖 LLM，纯规则）：
+ *   1. cues/title 反查 → 命中旧页
+ *   2. 新 Episode 正文里出现「错/过时/不对/推翻/相反/实际是」这类词
+ *      → 说明这是一条纠错性记录，命中的旧页高度可疑
+ *   3. 命中的旧页不是 Episode 本身、不是索引、不是 record
+ *
+ * 输出：写进 proposals/冲突待裁决.md，并返回列表
+ */
+function detectConflictsForEpisode({ id, relPath, cues, title, body, outcome }) {
+  // 纠错词表（2026-11-18 收紧两次）
+  //
+  // 第一次收：去掉「实测发现」「实际是」这类中性描述词。
+  //   原表太宽，正文「真实库压测」+ cue 含「真实」→ 误命中 8 条无关页。
+  //
+  // 第二次收（当前）：只认「明确宣布某结论是错的」的表述。
+  const NEGATION_WORDS = [
+    '是错的', '结论错', '判断错', '之前错', '原先错',
+    '推翻', '不成立', '作废', '失效',
+    '误判', '算错', '搞错', '不对',
+  ];
+
+  const titleText = String(title || '');
+  const bodyText = String(body || '');
+
+  const titleHasNeg = NEGATION_WORDS.some(w => titleText.includes(w));
+  const bodyHasNeg = NEGATION_WORDS.some(w => bodyText.includes(w));
+
+  // 触发条件收紧（2026-11-18）：
+  //   原条件：正文含纠错词就触发 → 误报太多（描述性文本里也有这些词）
+  //   新条件：必须 **标题宣布纠错** 或 **outcome=failure 且正文有纠错词**
+  //   理由：标题是"这条记录的主题声明"，正文可能只是顺带提到。
+  const isCorrectionRecord =
+    titleHasNeg ||
+    (outcome === 'failure' && bodyHasNeg);
+
+  if (!isCorrectionRecord) return [];
+
+  const pages = scanVault();
+
+  // ── 逐 cue 独立检索，取交集（2026-11-18 第四版）──
+  //
+  // 前三版都失败，根因是同一个：把多个 cue 拼成一个 query 后，
+  // 某个高频词（"路径"、"失败"）会把无关页顶到高分，
+  // 而真正该抓的 ADR-0037 因为标题不匹配而分数偏低。
+  //
+  // 第四版换思路：**每个 cue 单独搜，统计候选页被几个 cue 命中**。
+  // 被 ≥2 个不同 cue 命中的页才算嫌疑——这才符合"多个线索指向同一处"的直觉。
+  const cueList = [...(cues || []), title].filter(Boolean).map(String);
+  if (cueList.length === 0) return [];
+
+  const hitMap = new Map();   // path → { page, cues: Set, maxScore }
+
+  for (const cue of cueList) {
+    const res = recall(cue, pages, { limit: 10, minScore: 3 });
+    for (const r of res) {
+      if (r.path === relPath) continue;
+      if (['index', 'record', 'episode'].includes(r.kind)) continue;
+      if (r.refuted) continue;
+
+      if (!hitMap.has(r.path)) hitMap.set(r.path, { page: r, cues: new Set(), maxScore: 0 });
+      const e = hitMap.get(r.path);
+      e.cues.add(cue);
+      e.maxScore = Math.max(e.maxScore, r.score);
+    }
+  }
+
+  // 被 ≥2 个不同 cue 命中 → 强嫌疑
+  const suspects = [...hitMap.values()]
+    .filter(e => e.cues.size >= 2)
+    .map(e => ({ ...e.page, score: e.maxScore, hitBy: e.cues.size }))
+    .sort((a, b) => b.hitBy - a.hitBy || b.score - a.score)
+    .slice(0, 8);
+
+  if (suspects.length === 0) return [];
+
+  // 写待裁决清单
+  const dir = path.join(getSYS(), 'proposals');
+  fs.mkdirSync(dir, { recursive: true });
+  const f = path.join(dir, '冲突待裁决.md');
+
+  // 写清单前先检查：这个（新结论 + 旧页集合）是不是已经记过
+  // 2026-11-18 修：重复跑同一主题会累积重复条目，清单会越滚越长
+  const existTxt = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
+
+  const sig = suspects.map(s => s.path).sort().join('|');
+  const claimSig = String(title || '').trim();
+  const isDuplicate = existTxt.includes(`**新结论**：${claimSig}`) &&
+    suspects.every(s => existTxt.includes(s.path));
+
+  if (isDuplicate) {
+    appendLog({ op: 'conflict_detected', path: relPath, suspects: suspects.length, duplicate: true });
+    return suspects.map(s => ({ path: s.path, title: s.title, score: Math.round(s.score * 10) / 10 }));
